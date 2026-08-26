@@ -27,6 +27,8 @@ pub(crate) struct DaemonConfig {
 pub(crate) struct CodexConfig {
     pub(crate) live_mode: CodexLiveMode,
     pub(crate) websocket_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub(crate) struct TelegramSetupOptions<'a> {
     pub(crate) events: &'a str,
     pub(crate) bridge_command: &'a str,
     pub(crate) websocket_url: &'a str,
+    pub(crate) codex_home: Option<&'a str>,
     pub(crate) dry_run: bool,
     pub(crate) pair_timeout_ms: u64,
 }
@@ -74,6 +77,7 @@ pub(crate) struct SetupOptions<'a> {
     pub(crate) events: &'a str,
     pub(crate) bridge_command: &'a str,
     pub(crate) websocket_url: &'a str,
+    pub(crate) codex_home: Option<&'a str>,
     pub(crate) daemon_label: &'a str,
     pub(crate) install_daemon: bool,
     pub(crate) start_daemon: bool,
@@ -88,6 +92,7 @@ pub(crate) fn default_codex_config() -> CodexConfig {
     CodexConfig {
         live_mode: CodexLiveMode::Shared,
         websocket_url: crate::DEFAULT_CODEX_WEBSOCKET_URL.to_string(),
+        codex_home: None,
     }
 }
 
@@ -109,7 +114,7 @@ pub(crate) fn merged_daemon_config(
     codex: CodexConfig,
 ) -> DaemonConfig {
     DaemonConfig {
-        version: 4,
+        version: 5,
         bridge_command: bridge_command.to_string(),
         events: events.to_string(),
         telegram: Some(telegram),
@@ -166,6 +171,7 @@ pub(crate) fn load_daemon_config() -> Result<DaemonConfig> {
     }
     validate_shared_websocket_url(&codex.websocket_url)
         .context("daemon config codex.websocketUrl is invalid")?;
+    effective_codex_home(codex).context("daemon config codex.codexHome is invalid")?;
     for project in &config.projects {
         if project.id.trim().is_empty() {
             bail!("daemon config project id cannot be empty");
@@ -187,7 +193,8 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
         "events": config.events,
         "codex": config.codex.as_ref().map(|codex| json!({
             "liveMode": codex.live_mode,
-            "websocketUrl": codex.websocket_url
+            "websocketUrl": codex.websocket_url,
+            "codexHome": codex.codex_home
         })),
         "telegram": config.telegram.as_ref().map(|telegram| json!({
             "botToken": "<redacted>",
@@ -230,6 +237,34 @@ pub(crate) fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<Strin
         .context(
             "Telegram bot token is required. Pass --bot-token or set TELEGRAM_BOT_TOKEN after creating a bot with @BotFather.",
         )
+}
+
+pub(crate) fn resolve_codex_home(explicit: Option<&str>) -> Result<String> {
+    let path = match explicit {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                bail!("Codex home cannot be empty");
+            }
+            PathBuf::from(value)
+        }
+        None => dirs::home_dir()
+            .context("cannot determine the current user's home directory for default CODEX_HOME")?
+            .join(".codex"),
+    };
+
+    if !path.is_absolute() {
+        bail!(
+            "Codex home must be an absolute path, received {}",
+            path.display()
+        );
+    }
+
+    Ok(path.display().to_string())
+}
+
+pub(crate) fn effective_codex_home(config: &CodexConfig) -> Result<String> {
+    resolve_codex_home(config.codex_home.as_deref())
 }
 
 #[cfg(test)]
@@ -289,6 +324,7 @@ mod tests {
                 codex: Some(CodexConfig {
                     live_mode: CodexLiveMode::Shared,
                     websocket_url: "ws://127.0.0.1:4500".to_string(),
+                    codex_home: None,
                 }),
                 projects: vec![RegisteredProject {
                     id: "bridge".to_string(),
@@ -307,16 +343,41 @@ mod tests {
             CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: Some("/tmp/codex-home".to_string()),
             },
         );
 
-        assert_eq!(merged.version, 4);
+        assert_eq!(merged.version, 5);
         assert_eq!(merged.projects.len(), 1);
         assert_eq!(merged.projects[0].id, "bridge");
         assert_eq!(merged.telegram.as_ref().unwrap().chat_id, "456");
         let codex = merged.codex.as_ref().expect("codex config");
         assert_eq!(codex.live_mode, CodexLiveMode::Shared);
         assert_eq!(codex.websocket_url, "ws://127.0.0.1:4500");
+        assert_eq!(codex.codex_home.as_deref(), Some("/tmp/codex-home"));
+    }
+
+    #[test]
+    fn resolve_codex_home_uses_the_standard_default_when_omitted() {
+        let resolved = resolve_codex_home(None).expect("resolve default CODEX_HOME");
+        let expected = dirs::home_dir()
+            .expect("test user home")
+            .join(".codex")
+            .display()
+            .to_string();
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_codex_home_rejects_relative_paths() {
+        let error = resolve_codex_home(Some("relative/codex-home"))
+            .expect_err("relative CODEX_HOME should be rejected");
+
+        assert!(
+            format!("{error:#}").contains("must be an absolute path"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -333,6 +394,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: Some("/tmp/codex-home".to_string()),
             }),
             projects: vec![],
         };
@@ -341,6 +403,7 @@ mod tests {
 
         assert_eq!(redacted["codex"]["liveMode"], "shared");
         assert_eq!(redacted["codex"]["websocketUrl"], "ws://127.0.0.1:4500");
+        assert_eq!(redacted["codex"]["codexHome"], "/tmp/codex-home");
         assert_eq!(redacted["version"], 4);
     }
 
@@ -385,6 +448,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://example.com:4500".to_string(),
+                codex_home: None,
             }),
             projects: vec![],
         })
@@ -419,6 +483,36 @@ mod tests {
         let loaded = load_daemon_config().expect("load legacy config");
         assert_eq!(loaded.version, 3);
         assert_eq!(loaded.codex, Some(default_codex_config()));
+    }
+
+    #[test]
+    fn load_daemon_config_uses_default_codex_home_for_version_four_config() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: None,
+            }),
+            projects: vec![],
+        })
+        .expect("write version four config");
+
+        let loaded = load_daemon_config().expect("load version four config");
+        let codex = loaded.codex.as_ref().expect("codex config");
+        assert_eq!(
+            effective_codex_home(codex).expect("effective CODEX_HOME"),
+            resolve_codex_home(None).expect("default CODEX_HOME")
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ const TELEGRAM_CONTINUE_THREAD_HINT: &str =
 const TELEGRAM_ANSWER_THREAD_HINT: &str =
     "💬 To answer Codex, use Telegram's Reply action on this message.";
 const TELEGRAM_APPROVAL_HINT: &str =
-    "Use the buttons below, or use Telegram's Reply action on this message.";
+    "Choose one option below. The button is bound to this exact Codex request.";
+const TELEGRAM_INFERRED_APPROVAL_HINT: &str =
+    "Open the active Codex client to answer this approval.";
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
 const TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT: usize = 3000;
 
@@ -43,8 +45,10 @@ fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
 }
 
 fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
-    if telegram_event_is_approval(event) {
+    if telegram_event_is_native_approval(event) {
         TELEGRAM_APPROVAL_HINT
+    } else if telegram_event_is_approval(event) {
+        TELEGRAM_INFERRED_APPROVAL_HINT
     } else {
         match event_type {
             "thread_waiting" => TELEGRAM_ANSWER_THREAD_HINT,
@@ -65,8 +69,13 @@ fn telegram_event_display_name(event: &Value) -> String {
 
 fn telegram_event_detail(event: &Value) -> Option<String> {
     event
-        .pointer("/thread/pendingPrompt/question")
+        .pointer("/approvalRequest/summary")
         .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .pointer("/thread/pendingPrompt/question")
+                .and_then(Value::as_str)
+        })
         .or_else(|| event.pointer("/thread/lastPreview").and_then(Value::as_str))
         .or_else(|| event.get("lastPreview").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
@@ -74,14 +83,23 @@ fn telegram_event_detail(event: &Value) -> Option<String> {
 }
 
 fn telegram_event_is_approval(event: &Value) -> bool {
-    event
-        .pointer("/thread/pendingPrompt/promptKind")
-        .and_then(Value::as_str)
-        == Some("approval")
+    telegram_event_is_native_approval(event)
+        || event.get("promptKind").and_then(Value::as_str) == Some("approval")
+        || event
+            .pointer("/thread/pendingPrompt/promptKind")
+            .and_then(Value::as_str)
+            == Some("approval")
         || event
             .pointer("/thread/pendingPrompt/kind")
             .and_then(Value::as_str)
             == Some("approval")
+}
+
+fn telegram_event_is_native_approval(event: &Value) -> bool {
+    event
+        .pointer("/approvalRequest/approvalKey")
+        .and_then(Value::as_str)
+        .is_some()
 }
 
 fn telegram_callback_id(event_id: &str, action: TelegramCallbackAction) -> String {
@@ -198,15 +216,25 @@ pub(crate) fn prepare_telegram_delivery(
         .collect::<Vec<_>>();
 
     let mut callback_routes = Vec::new();
-    if telegram_event_is_approval(event) {
+    if let Some(approval_key) = event
+        .pointer("/approvalRequest/approvalKey")
+        .and_then(Value::as_str)
+    {
         if let Some(thread_id) = thread_id.as_ref() {
             let approve_id = telegram_callback_id(&event_id, TelegramCallbackAction::Approve);
+            let approve_session_id =
+                telegram_callback_id(&event_id, TelegramCallbackAction::ApproveForSession);
             let deny_id = telegram_callback_id(&event_id, TelegramCallbackAction::Deny);
             payloads[0]["reply_markup"] = json!({
-                "inline_keyboard": [[
-                    { "text": "✅ Approve", "callback_data": format!("codex:{approve_id}") },
-                    { "text": "🛑 Deny", "callback_data": format!("codex:{deny_id}") }
-                ]]
+                "inline_keyboard": [
+                    [
+                        { "text": "✅ Allow once", "callback_data": format!("codex:{approve_id}") },
+                        { "text": "🔓 Allow session", "callback_data": format!("codex:{approve_session_id}") }
+                    ],
+                    [
+                        { "text": "🛑 Deny", "callback_data": format!("codex:{deny_id}") }
+                    ]
+                ]
             });
             callback_routes.push(TelegramCallbackRoute {
                 callback_id: approve_id,
@@ -214,6 +242,15 @@ pub(crate) fn prepare_telegram_delivery(
                 message_id: None,
                 thread_id: thread_id.clone(),
                 action: TelegramCallbackAction::Approve,
+                approval_key: Some(approval_key.to_string()),
+            });
+            callback_routes.push(TelegramCallbackRoute {
+                callback_id: approve_session_id,
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.clone(),
+                action: TelegramCallbackAction::ApproveForSession,
+                approval_key: Some(approval_key.to_string()),
             });
             callback_routes.push(TelegramCallbackRoute {
                 callback_id: deny_id,
@@ -221,6 +258,7 @@ pub(crate) fn prepare_telegram_delivery(
                 message_id: None,
                 thread_id: thread_id.clone(),
                 action: TelegramCallbackAction::Deny,
+                approval_key: Some(approval_key.to_string()),
             });
         }
     }
@@ -497,6 +535,10 @@ mod tests {
             "type": "thread_waiting",
             "threadId": "thr_approval",
             "updatedAt": 42,
+            "approvalRequest": {
+                "approvalKey": "approval_exact_request",
+                "summary": "Deploy to production?"
+            },
             "thread": {
                 "displayName": "Approve deploy",
                 "project": "infra",
@@ -512,20 +554,31 @@ mod tests {
 
         assert_eq!(prepared.thread_id.as_deref(), Some("thr_approval"));
         assert_eq!(prepared.payloads.len(), 1);
-        assert_eq!(prepared.callback_routes.len(), 2);
+        assert_eq!(prepared.callback_routes.len(), 3);
         let reply_markup = prepared.payloads[0]["reply_markup"]["inline_keyboard"]
             .as_array()
             .expect("inline keyboard");
-        assert_eq!(reply_markup.len(), 1);
-        let buttons = reply_markup[0].as_array().expect("buttons");
-        assert_eq!(buttons.len(), 2);
-        assert_eq!(buttons[0]["text"], "✅ Approve");
-        assert_eq!(buttons[1]["text"], "🛑 Deny");
+        assert_eq!(reply_markup.len(), 2);
+        let allow_buttons = reply_markup[0].as_array().expect("allow buttons");
+        let deny_buttons = reply_markup[1].as_array().expect("deny buttons");
+        assert_eq!(allow_buttons.len(), 2);
+        assert_eq!(deny_buttons.len(), 1);
+        assert_eq!(allow_buttons[0]["text"], "✅ Allow once");
+        assert_eq!(allow_buttons[1]["text"], "🔓 Allow session");
+        assert_eq!(deny_buttons[0]["text"], "🛑 Deny");
         assert_eq!(
             prepared.callback_routes[0].action,
             TelegramCallbackAction::Approve
         );
-        for button in buttons {
+        assert_eq!(
+            prepared.callback_routes[1].action,
+            TelegramCallbackAction::ApproveForSession
+        );
+        assert!(prepared
+            .callback_routes
+            .iter()
+            .all(|route| route.approval_key.as_deref() == Some("approval_exact_request")));
+        for button in allow_buttons.iter().chain(deny_buttons) {
             let callback_data = button["callback_data"].as_str().expect("callback data");
             assert!(
                 callback_data.len() <= 64,
@@ -613,6 +666,10 @@ mod tests {
             "type": "thread_waiting",
             "threadId": "thr_approval",
             "updatedAt": 42,
+            "approvalRequest": {
+                "approvalKey": "approval_hotfix",
+                "summary": "Ship the hotfix?"
+            },
             "thread": {
                 "displayName": "Deploy request",
                 "project": "infra",
@@ -629,9 +686,8 @@ mod tests {
             .expect("telegram text");
         assert!(text.starts_with("🔐 Codex needs approval"));
         assert!(text.contains("Ship the hotfix?"));
-        assert!(
-            text.contains("Use the buttons below, or use Telegram's Reply action on this message.")
-        );
+        assert!(text
+            .contains("Choose one option below. The button is bound to this exact Codex request."));
     }
 
     #[test]

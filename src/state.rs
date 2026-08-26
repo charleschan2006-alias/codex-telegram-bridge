@@ -170,11 +170,13 @@ pub(crate) struct TelegramCallbackRoute {
     pub(crate) message_id: Option<i64>,
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
+    pub(crate) approval_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TelegramCallbackAction {
     Approve,
+    ApproveForSession,
     Deny,
 }
 
@@ -182,6 +184,7 @@ impl TelegramCallbackAction {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
+            Self::ApproveForSession => "approve_for_session",
             Self::Deny => "deny",
         }
     }
@@ -189,10 +192,22 @@ impl TelegramCallbackAction {
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
             "approve" => Some(Self::Approve),
+            "approve_for_session" => Some(Self::ApproveForSession),
             "deny" => Some(Self::Deny),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppServerApprovalRequest {
+    pub(crate) approval_key: String,
+    pub(crate) request_id: Value,
+    pub(crate) method: String,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) params: Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -446,7 +461,17 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM actions_log WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
-    Ok(inbound + actions)
+    let callbacks = conn.execute(
+        "DELETE FROM telegram_callback_routes
+         WHERE created_at < ?1 AND used_at IS NOT NULL",
+        params![sql_cutoff],
+    )?;
+    let approvals = conn.execute(
+        "DELETE FROM app_server_approval_requests
+         WHERE created_at < ?1 AND status != 'pending'",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound + actions + callbacks + approvals)
 }
 
 #[cfg(test)]
@@ -522,8 +547,22 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           message_id INTEGER,
           thread_id TEXT NOT NULL,
           action TEXT NOT NULL,
+          approval_key TEXT,
           created_at INTEGER NOT NULL,
           used_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS app_server_approval_requests (
+          approval_key TEXT PRIMARY KEY,
+          request_id_json TEXT NOT NULL,
+          method TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          item_id TEXT NOT NULL,
+          params_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          responded_at INTEGER,
+          resolved_at INTEGER
         );
         CREATE TABLE IF NOT EXISTS telegram_command_routes (
           chat_id TEXT NOT NULL,
@@ -567,6 +606,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "approval_key", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
@@ -576,6 +616,12 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
         "telegram_inbound_log",
         "codex_app_server_pid",
         "INTEGER",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS app_server_approval_request_lookup
+           ON app_server_approval_requests(thread_id, request_id_json, status);
+         CREATE INDEX IF NOT EXISTS telegram_callback_approval_lookup
+           ON telegram_callback_routes(approval_key, used_at);",
     )?;
     Ok(())
 }
@@ -1552,18 +1598,174 @@ pub(crate) fn insert_telegram_callback_route(
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        "INSERT INTO telegram_callback_routes(
+            callback_id, chat_id, message_id, thread_id, action, approval_key, created_at, used_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+         ON CONFLICT(callback_id) DO UPDATE SET
+            chat_id = excluded.chat_id,
+            message_id = COALESCE(excluded.message_id, telegram_callback_routes.message_id),
+            thread_id = excluded.thread_id,
+            action = excluded.action,
+            approval_key = excluded.approval_key",
         params![
             route.callback_id,
             route.chat_id,
             route.message_id,
             route.thread_id,
             route.action.as_str(),
-            to_sql_i64(now)?
+            route.approval_key,
+            to_sql_i64(now)?,
         ],
     )?;
     Ok(())
+}
+
+pub(crate) fn upsert_app_server_approval_request(
+    conn: &Connection,
+    request: &AppServerApprovalRequest,
+    now: u64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO app_server_approval_requests(
+            approval_key, request_id_json, method, thread_id, turn_id, item_id,
+            params_json, status, created_at, responded_at, resolved_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, NULL)
+         ON CONFLICT(approval_key) DO UPDATE SET
+            request_id_json = excluded.request_id_json,
+            method = excluded.method,
+            thread_id = excluded.thread_id,
+            turn_id = excluded.turn_id,
+            item_id = excluded.item_id,
+            params_json = excluded.params_json,
+            status = 'pending',
+            created_at = excluded.created_at,
+            responded_at = NULL,
+            resolved_at = NULL
+         WHERE app_server_approval_requests.status != 'pending'",
+        params![
+            request.approval_key,
+            serde_json::to_string(&request.request_id)?,
+            request.method,
+            request.thread_id,
+            request.turn_id,
+            request.item_id,
+            serde_json::to_string(&request.params)?,
+            to_sql_i64(now)?,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+pub(crate) fn lookup_pending_app_server_approval(
+    conn: &Connection,
+    approval_key: &str,
+) -> Result<Option<AppServerApprovalRequest>> {
+    let row = conn
+        .query_row(
+            "SELECT request_id_json, method, thread_id, turn_id, item_id, params_json
+             FROM app_server_approval_requests
+             WHERE approval_key = ?1 AND status = 'pending'",
+            params![approval_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(request_id_json, method, thread_id, turn_id, item_id, params_json)| {
+            Ok(AppServerApprovalRequest {
+                approval_key: approval_key.to_string(),
+                request_id: serde_json::from_str(&request_id_json)
+                    .context("invalid stored app-server approval request id")?,
+                method,
+                thread_id,
+                turn_id,
+                item_id,
+                params: serde_json::from_str(&params_json)
+                    .context("invalid stored app-server approval params")?,
+            })
+        },
+    )
+    .transpose()
+}
+
+pub(crate) fn mark_app_server_approval_responded(
+    conn: &Connection,
+    approval_key: &str,
+    now: u64,
+) -> Result<bool> {
+    let now = to_sql_i64(now)?;
+    let changed = conn.execute(
+        "UPDATE app_server_approval_requests
+         SET status = 'responded', responded_at = ?2
+         WHERE approval_key = ?1 AND status = 'pending'",
+        params![approval_key, now],
+    )?;
+    if changed > 0 {
+        conn.execute(
+            "UPDATE telegram_callback_routes
+             SET used_at = ?2
+             WHERE approval_key = ?1 AND used_at IS NULL",
+            params![approval_key, now],
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+pub(crate) fn expire_app_server_approval(
+    conn: &Connection,
+    approval_key: &str,
+    now: u64,
+) -> Result<()> {
+    let now = to_sql_i64(now)?;
+    conn.execute(
+        "UPDATE app_server_approval_requests
+         SET status = 'expired', resolved_at = ?2
+         WHERE approval_key = ?1 AND status = 'pending'",
+        params![approval_key, now],
+    )?;
+    conn.execute(
+        "UPDATE telegram_callback_routes
+         SET used_at = ?2
+         WHERE approval_key = ?1 AND used_at IS NULL",
+        params![approval_key, now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn resolve_app_server_approval_request(
+    conn: &Connection,
+    thread_id: &str,
+    request_id: &Value,
+    now: u64,
+) -> Result<usize> {
+    let request_id_json = serde_json::to_string(request_id)?;
+    let now = to_sql_i64(now)?;
+    conn.execute(
+        "UPDATE telegram_callback_routes
+         SET used_at = ?3
+         WHERE approval_key IN (
+             SELECT approval_key FROM app_server_approval_requests
+             WHERE thread_id = ?1 AND request_id_json = ?2
+               AND status IN ('pending', 'responded')
+         ) AND used_at IS NULL",
+        params![thread_id, request_id_json, now],
+    )?;
+    let changed = conn.execute(
+        "UPDATE app_server_approval_requests
+         SET status = 'resolved', resolved_at = ?3
+         WHERE thread_id = ?1 AND request_id_json = ?2
+           AND status IN ('pending', 'responded')",
+        params![thread_id, request_id_json, now],
+    )?;
+    Ok(changed)
 }
 
 pub(crate) fn insert_telegram_command_route(
@@ -2037,9 +2239,10 @@ mod tests {
             &TelegramCallbackRoute {
                 callback_id: "cb_1".to_string(),
                 chat_id: "456".to_string(),
-                message_id: None,
+                message_id: Some(111),
                 thread_id: "thr_approval".to_string(),
                 action: TelegramCallbackAction::Deny,
+                approval_key: None,
             },
             1000,
         )
@@ -2068,6 +2271,92 @@ mod tests {
         assert_eq!(routed.thread_id, "thr_approval");
         assert_eq!(routed.action, TelegramCallbackAction::Deny);
         assert_eq!(routed.callback_query_id, "callback-query-id");
+        assert!(routed.approval_key.is_none());
+
+        let forged_message = extract_telegram_callback_route(
+            &conn,
+            &json!({
+                "id": "forged-callback-query",
+                "from": { "id": 789 },
+                "message": {
+                    "message_id": 112,
+                    "chat": { "id": 456 }
+                },
+                "data": "codex:cb_1"
+            }),
+            &TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            },
+        )
+        .expect("forged route lookup");
+        assert!(forged_message.is_none());
+    }
+
+    #[test]
+    fn app_server_approval_state_dedupes_and_expires_all_related_buttons() {
+        let conn = create_state_db_in_memory().expect("db");
+        let request = AppServerApprovalRequest {
+            approval_key: "approval_1".to_string(),
+            request_id: json!(61),
+            method: "item/commandExecution/requestApproval".to_string(),
+            thread_id: "thr_approval".to_string(),
+            turn_id: "turn_1".to_string(),
+            item_id: "item_1".to_string(),
+            params: json!({
+                "threadId": "thr_approval",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "command": "git push"
+            }),
+        };
+        assert!(upsert_app_server_approval_request(&conn, &request, 1000).expect("insert approval"));
+        assert!(
+            !upsert_app_server_approval_request(&conn, &request, 1001).expect("dedupe approval")
+        );
+        for (callback_id, action) in [
+            ("cb_once", TelegramCallbackAction::Approve),
+            ("cb_session", TelegramCallbackAction::ApproveForSession),
+            ("cb_deny", TelegramCallbackAction::Deny),
+        ] {
+            insert_telegram_callback_route(
+                &conn,
+                &TelegramCallbackRoute {
+                    callback_id: callback_id.to_string(),
+                    chat_id: "456".to_string(),
+                    message_id: Some(10),
+                    thread_id: "thr_approval".to_string(),
+                    action,
+                    approval_key: Some("approval_1".to_string()),
+                },
+                1000,
+            )
+            .expect("insert approval callback");
+        }
+
+        assert_eq!(
+            lookup_pending_app_server_approval(&conn, "approval_1")
+                .expect("lookup")
+                .expect("pending"),
+            request
+        );
+        assert_eq!(
+            resolve_app_server_approval_request(&conn, "thr_approval", &json!(61), 1100)
+                .expect("resolve"),
+            1
+        );
+        assert!(lookup_pending_app_server_approval(&conn, "approval_1")
+            .expect("lookup after resolve")
+            .is_none());
+        let unused: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_callback_routes WHERE approval_key = ?1 AND used_at IS NULL",
+                params!["approval_1"],
+                |row| row.get(0),
+            )
+            .expect("count unused callbacks");
+        assert_eq!(unused, 0);
     }
 
     #[test]

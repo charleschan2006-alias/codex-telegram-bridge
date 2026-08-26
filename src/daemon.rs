@@ -11,13 +11,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codex::{
-    filter_watch_events, parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
-    watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient,
+    app_server_approval_event, codex_backend_from_config, filter_watch_events,
+    parse_app_server_approval_request, parse_event_filter, start_codex_watch_receiver,
+    sync_state_from_live, watch_events_from_sync_result, watch_thread_error_event,
+    CodexAppServerClient,
 };
 use crate::state::{
-    create_state_db, deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
-    prune_state_logs, record_transport_delivery, should_emit_for_away_window, state_db_path,
-    transport_delivery_exists, OutboxDeliverySummary,
+    create_state_db, deliver_due_outbound_events, enqueue_outbound_event,
+    lookup_pending_app_server_approval, pending_outbound_count, prune_state_logs,
+    record_transport_delivery, resolve_app_server_approval_request, should_emit_for_away_window,
+    state_db_path, transport_delivery_exists, upsert_app_server_approval_request,
+    OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
@@ -64,6 +68,7 @@ fn acquire_daemon_lock() -> Result<DaemonLock> {
     let path = daemon_lock_path()?;
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -103,8 +108,9 @@ pub(crate) fn daemon_lock_free() -> Result<bool> {
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to probe daemon lock at {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to probe daemon lock at {}", path.display()))
+        }
     }
 }
 
@@ -191,16 +197,16 @@ fn deliver_outbound_events(
     deliver_due_outbound_events(conn, now, 100, Some(deadline), |event| {
         let event_id = notification_event_id(event);
         let telegram = if let Some(telegram) = config.telegram.as_ref() {
-                if transport_delivery_exists(conn, &event_id, "telegram")? {
-                    json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
-                } else {
-                    let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
-                    record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
-                    result
-                }
+            if transport_delivery_exists(conn, &event_id, "telegram")? {
+                json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
             } else {
-                Value::Null
-            };
+                let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
+                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+                result
+            }
+        } else {
+            Value::Null
+        };
         Ok(json!({ "telegram": telegram }))
     })
 }
@@ -209,11 +215,131 @@ fn daemon_cycle_budget(timeout: Duration) -> Duration {
     timeout.max(Duration::from_secs(5)).saturating_mul(3)
 }
 
+fn ensure_daemon_app_server_client<'a>(
+    client: &'a mut Option<CodexAppServerClient>,
+    config: &DaemonConfig,
+) -> Result<&'a mut CodexAppServerClient> {
+    let backend = codex_backend_from_config(config)?;
+    if client
+        .as_ref()
+        .is_some_and(|current| !current.matches_backend(&backend))
+    {
+        *client = None;
+    }
+    if client.is_none() {
+        let mut connected = CodexAppServerClient::connect_with_backend(backend)?;
+        connected.enable_active_thread_subscriptions();
+        *client = Some(connected);
+    }
+    client
+        .as_mut()
+        .context("daemon app-server client was not initialized")
+}
+
+fn enrich_approval_event_with_thread(mut event: Value, sync_result: &Value) -> Value {
+    let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
+        return event;
+    };
+    let thread = sync_result
+        .get("threads")
+        .and_then(Value::as_array)
+        .and_then(|threads| {
+            threads
+                .iter()
+                .find(|thread| thread.get("threadId").and_then(Value::as_str) == Some(thread_id))
+        })
+        .cloned();
+    if let (Some(object), Some(thread)) = (event.as_object_mut(), thread) {
+        object.insert("thread".to_string(), thread);
+    }
+    event
+}
+
+fn collect_daemon_app_server_events(
+    client: &mut CodexAppServerClient,
+    conn: &Connection,
+    sync_result: &Value,
+    now: u64,
+    filter: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Vec<Value>> {
+    let mut observed_approvals = Vec::new();
+    for message in client.drain_server_requests() {
+        let Some(request) = parse_app_server_approval_request(&message)? else {
+            continue;
+        };
+        let is_new = upsert_app_server_approval_request(conn, &request, now)?;
+        observed_approvals.push((request, is_new));
+    }
+
+    let notifications = client.drain_notifications();
+    for notification in &notifications {
+        if notification.get("method").and_then(Value::as_str) != Some("serverRequest/resolved") {
+            continue;
+        }
+        let Some(thread_id) = notification
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(request_id) = notification.pointer("/params/requestId") else {
+            continue;
+        };
+        resolve_app_server_approval_request(conn, thread_id, request_id, now)?;
+    }
+
+    let active_native_threads = observed_approvals
+        .iter()
+        .map(|(request, _)| request.thread_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut native_events = Vec::new();
+    for (request, is_new) in observed_approvals {
+        if !is_new {
+            continue;
+        }
+        if let Some(request) = lookup_pending_app_server_approval(conn, &request.approval_key)? {
+            let item = notifications.iter().find_map(|notification| {
+                if notification.get("method").and_then(Value::as_str) != Some("item/started")
+                    || notification
+                        .pointer("/params/threadId")
+                        .and_then(Value::as_str)
+                        != Some(request.thread_id.as_str())
+                    || notification
+                        .pointer("/params/turnId")
+                        .and_then(Value::as_str)
+                        != Some(request.turn_id.as_str())
+                {
+                    return None;
+                }
+                notification
+                    .pointer("/params/item")
+                    .filter(|item| item.get("id").and_then(Value::as_str) == Some(&request.item_id))
+            });
+            native_events.push(enrich_approval_event_with_thread(
+                app_server_approval_event(&request, now, item),
+                sync_result,
+            ));
+        }
+    }
+    let mut events = watch_events_from_sync_result(sync_result, notifications, filter);
+    events.retain(|event| {
+        !(event.get("type").and_then(Value::as_str) == Some("thread_waiting")
+            && event.get("promptKind").and_then(Value::as_str) == Some("approval")
+            && event
+                .get("threadId")
+                .and_then(Value::as_str)
+                .is_some_and(|thread_id| active_native_threads.contains(thread_id)))
+    });
+    events.extend(filter_watch_events(native_events, filter));
+    Ok(events)
+}
+
 fn daemon_cycle(
     conn: &Connection,
     config: &DaemonConfig,
     now: u64,
     timeout: Duration,
+    app_server_client: &mut Option<CodexAppServerClient>,
 ) -> Result<Value> {
     let deadline = Instant::now() + daemon_cycle_budget(timeout);
     let filter = parse_event_filter(Some(&config.events));
@@ -253,17 +379,18 @@ fn daemon_cycle(
         }
         None => Value::Null,
     };
-    let events = match CodexAppServerClient::connect_configured(config).and_then(|mut client| {
+    let events_result = (|| {
+        let client = ensure_daemon_app_server_client(app_server_client, config)?;
         client.set_deadline(deadline);
-        let sync_result = sync_state_from_live(&mut client, conn, now, 50, true)?;
-        Ok(watch_events_from_sync_result(
-            &sync_result,
-            client.drain_notifications(),
-            filter.as_ref(),
-        ))
-    }) {
+        let sync_result = sync_state_from_live(client, conn, now, 50, true)?;
+        collect_daemon_app_server_events(client, conn, &sync_result, now, filter.as_ref())
+    })();
+    let events = match events_result {
         Ok(events) => events,
-        Err(error) => filter_watch_events(vec![watch_thread_error_event(&error)], filter.as_ref()),
+        Err(error) => {
+            *app_server_client = None;
+            filter_watch_events(vec![watch_thread_error_event(&error)], filter.as_ref())
+        }
     };
     let enqueued = enqueue_daemon_notification_events(conn, &events, now)?;
     let delivery = if away_notifications_enabled(conn)? {
@@ -288,25 +415,29 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
     let config = load_daemon_config()?;
+    let mut app_server_client = None;
     if once {
-        let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
+        let result = daemon_cycle(
+            &conn,
+            &config,
+            now_millis()?,
+            timeout,
+            &mut app_server_client,
+        )?;
         println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
 
-    let telegram_commands = config
-        .telegram
-        .as_ref()
-        .map(|telegram| {
-            telegram_set_my_commands(telegram, timeout)
-                .map(|_| json!({ "registered": true }))
-                .unwrap_or_else(|error| {
-                    json!({
-                        "registered": false,
-                        "error": format!("{error:#}")
-                    })
+    let telegram_commands = config.telegram.as_ref().map(|telegram| {
+        telegram_set_my_commands(telegram, timeout)
+            .map(|_| json!({ "registered": true }))
+            .unwrap_or_else(|error| {
+                json!({
+                    "registered": false,
+                    "error": format!("{error:#}")
                 })
-        });
+            })
+    });
 
     println!(
         "{}",
@@ -376,7 +507,7 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
             }
             last_prune_at = now;
         }
-        match daemon_cycle(&conn, &config, now, timeout) {
+        match daemon_cycle(&conn, &config, now, timeout, &mut app_server_client) {
             Ok(result) => println!("{}", result),
             Err(error) => {
                 println!(
@@ -684,6 +815,16 @@ fn run_shell_command(command: &str) -> Result<Value> {
     }))
 }
 
+fn command_status_summary(output: &Value) -> Value {
+    json!({
+        "status": output.get("status").cloned().unwrap_or(Value::Null),
+        "success": output
+            .get("success")
+            .cloned()
+            .unwrap_or(Value::Bool(false))
+    })
+}
+
 fn macos_service_runtime(output: &Value) -> Value {
     let stdout = output
         .get("stdout")
@@ -705,7 +846,7 @@ fn macos_service_runtime(output: &Value) -> Value {
             "loaded": !not_loaded,
             "running": false,
             "state": Value::Null,
-            "raw": output
+            "raw": command_status_summary(output)
         });
     }
 
@@ -719,7 +860,7 @@ fn macos_service_runtime(output: &Value) -> Value {
         "loaded": true,
         "running": running,
         "state": state,
-        "raw": output
+        "raw": command_status_summary(output)
     })
 }
 
@@ -744,8 +885,8 @@ fn linux_service_runtime(unit_name: &str, status_output: &Value) -> Result<Value
         "running": active == "active",
         "state": if active.is_empty() { Value::Null } else { json!(active) },
         "raw": {
-            "status": status_output,
-            "isActive": active_output
+            "status": command_status_summary(status_output),
+            "isActive": command_status_summary(&active_output)
         }
     }))
 }
@@ -1024,11 +1165,13 @@ mod tests {
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
 
-        let result = daemon_cycle(&conn, &config, 1000, Duration::from_millis(10)).expect("cycle");
+        let result = daemon_cycle(&conn, &config, 1000, Duration::from_millis(10), &mut None)
+            .expect("cycle");
 
         assert_eq!(result["action"], "daemon_cycle");
         assert_eq!(result["observed"], 1);
@@ -1047,6 +1190,7 @@ mod tests {
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
@@ -1074,6 +1218,7 @@ mod tests {
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url,
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
@@ -1154,19 +1299,23 @@ mod tests {
     #[test]
     fn macos_service_runtime_marks_running_services_as_loaded() {
         let runtime = macos_service_runtime(&json!({
+            "status": 0,
             "success": true,
-            "stdout": "gui/501/example = {\n\tstate = running\n}\n",
+            "stdout": "gui/501/example = {\n\tstate = running\n\tenvironment = {\n\t\tAPI_KEY => secret\n\t}\n}\n",
             "stderr": ""
         }));
 
         assert_eq!(runtime["loaded"], true);
         assert_eq!(runtime["running"], true);
         assert_eq!(runtime["state"], "running");
+        assert_eq!(runtime["raw"], json!({"status": 0, "success": true}));
+        assert!(!runtime.to_string().contains("secret"));
     }
 
     #[test]
     fn macos_service_runtime_marks_missing_services_as_not_loaded() {
         let runtime = macos_service_runtime(&json!({
+            "status": 113,
             "success": false,
             "stdout": "",
             "stderr": "Bad request.\nCould not find service \"example\" in domain for user gui: 501"
@@ -1175,5 +1324,7 @@ mod tests {
         assert_eq!(runtime["loaded"], false);
         assert_eq!(runtime["running"], false);
         assert_eq!(runtime["state"], Value::Null);
+        assert_eq!(runtime["raw"], json!({"status": 113, "success": false}));
+        assert!(!runtime.to_string().contains("Could not find service"));
     }
 }

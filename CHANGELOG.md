@@ -4,7 +4,9 @@ All notable changes to `codex-telegram-bridge` will be documented here.
 
 ## Unreleased
 
-No unreleased changes yet.
+- Add `setup --codex-home` and `telegram setup --codex-home`; setup stores `~/.codex` when omitted, and the daemon passes the saved `CODEX_HOME` to its managed Codex App Server.
+- Keep a persistent App Server subscription to active threads and bridge native command, file-change, and permissions approval requests to Telegram with exact request-bound `Allow once`, `Allow session`, and `Deny` buttons.
+- Redact service-manager stdout and stderr from `daemon status` so inherited environment variables and credentials are never returned in its JSON output.
 
 ## 0.1.1 - 2026-08-08
 

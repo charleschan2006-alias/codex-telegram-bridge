@@ -52,14 +52,12 @@ use crate::state::{
     deliver_due_outbound_events, enqueue_outbound_event, record_transport_delivery,
     transport_delivery_exists, OutboxDeliverySummary,
 };
-use crate::telegram::{
-    telegram_setup_result, telegram_status_result, telegram_test_result,
-};
+use crate::telegram::{telegram_setup_result, telegram_status_result, telegram_test_result};
 use clap::Parser;
 pub(crate) use config::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, CodexConfig,
-    CodexLiveMode, DaemonConfig, RegisteredProject, SetupOptions, TelegramConfig,
+    redacted_daemon_config, resolve_codex_home, resolve_telegram_bot_token, write_daemon_config,
+    CodexConfig, CodexLiveMode, DaemonConfig, RegisteredProject, SetupOptions, TelegramConfig,
     TelegramSetupOptions,
 };
 #[allow(unused_imports)]
@@ -105,6 +103,7 @@ struct DoctorBridge {
     codex_configured: bool,
     codex_live_mode: Option<String>,
     codex_websocket_url: Option<String>,
+    codex_home: Option<String>,
     live_backend_healthy: Option<bool>,
     live_backend_pid: Option<u32>,
     live_backend_error: Option<String>,
@@ -166,6 +165,7 @@ fn run() -> Result<()> {
             events,
             bridge_command,
             websocket_url,
+            codex_home,
             daemon_label,
             install_daemon,
             start_daemon,
@@ -182,6 +182,7 @@ fn run() -> Result<()> {
                 events: &events,
                 bridge_command: &bridge_command,
                 websocket_url: &websocket_url,
+                codex_home: codex_home.as_deref(),
                 daemon_label: &daemon_label,
                 install_daemon,
                 start_daemon,
@@ -447,6 +448,7 @@ fn run() -> Result<()> {
                 events,
                 bridge_command,
                 websocket_url,
+                codex_home,
                 pair_timeout_ms,
                 dry_run,
             } => {
@@ -457,6 +459,7 @@ fn run() -> Result<()> {
                     events: &events,
                     bridge_command: &bridge_command,
                     websocket_url: &websocket_url,
+                    codex_home: codex_home.as_deref(),
                     dry_run,
                     pair_timeout_ms,
                 })?;
@@ -1008,6 +1011,7 @@ fn doctor_bridge() -> Result<DoctorBridge> {
             CodexLiveMode::Shared => "shared".to_string(),
         }),
         codex_websocket_url: codex.map(|codex| codex.websocket_url.clone()),
+        codex_home: codex.and_then(|codex| config::effective_codex_home(codex).ok()),
         live_backend_healthy,
         live_backend_pid,
         live_backend_error,
@@ -1050,6 +1054,7 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
         events: options.events,
         bridge_command: options.bridge_command,
         websocket_url: options.websocket_url,
+        codex_home: options.codex_home,
         dry_run: options.dry_run,
         pair_timeout_ms: options.pair_timeout_ms,
     })?;
@@ -1680,6 +1685,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: websocket_url.to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         })
@@ -1896,11 +1902,17 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         })
         .expect("write config");
-        for name in ["state.db", "state.db-wal", "remote-mode.json", "live-backend.json"] {
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "remote-mode.json",
+            "live-backend.json",
+        ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
 
@@ -1948,6 +1960,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         })
@@ -1996,7 +2009,9 @@ mod tests {
             state.root.join("config.json").exists(),
             "config must be preserved"
         );
-        let removed = result["removedFiles"].as_array().expect("removedFiles array");
+        let removed = result["removedFiles"]
+            .as_array()
+            .expect("removedFiles array");
         let names = removed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         assert!(names.contains(&"state.db"));
         assert!(names.contains(&"remote-mode.json"));

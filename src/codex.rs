@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use notify::Watcher as _;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -25,7 +25,7 @@ use crate::state::{
     clear_pending_outbound_events, derive_thread_display_name, get_setting_number,
     get_setting_text, recent_actions_json, reconcile_thread_snapshots, remote_mode_status_path,
     set_setting, set_setting_text, should_emit_for_away_window, upsert_thread_snapshot,
-    BridgeThreadSnapshot, PendingPrompt,
+    AppServerApprovalRequest, BridgeThreadSnapshot, PendingPrompt, TelegramCallbackAction,
 };
 use crate::ws::{validate_shared_websocket_url, WsJsonRpcTransport};
 
@@ -84,6 +84,11 @@ fn event_type(event: &Value) -> Option<&str> {
 
 fn summary_updated_at(summary: &Value) -> Option<u64> {
     summary.get("updatedAt").and_then(Value::as_u64)
+}
+
+fn thread_summary_is_active(summary: &Value) -> bool {
+    summary.pointer("/status/type").and_then(Value::as_str) == Some("active")
+        || summary.get("status").and_then(Value::as_str) == Some("active")
 }
 
 fn turn_timestamp(turn: &Value) -> Option<u64> {
@@ -508,6 +513,9 @@ pub(crate) fn sync_state_from_live(
                 .get("id")
                 .and_then(Value::as_str)
                 .context("thread id missing in thread/list")?;
+            if client.should_subscribe_to_active_threads() && thread_summary_is_active(summary) {
+                client.ensure_thread_subscription(thread_id)?;
+            }
             let include_turns =
                 away && should_emit_for_away_window(away_started_at, summary_updated_at(summary));
             let read = client.request(
@@ -1527,9 +1535,13 @@ pub(crate) fn codex_backend_from_codex_config(codex: &CodexConfig) -> Result<Cod
 }
 
 pub(crate) struct CodexAppServerClient {
+    backend: CodexBackend,
     transport: CodexTransport,
     next_id: u64,
     notifications: Vec<Value>,
+    server_requests: Vec<Value>,
+    subscribe_to_active_threads: bool,
+    subscribed_thread_ids: HashSet<String>,
     pending_transport_error: Option<String>,
     request_timeout: Duration,
     deadline: Option<Instant>,
@@ -1603,18 +1615,22 @@ impl CodexAppServerClient {
     }
 
     pub(crate) fn connect_with_backend(backend: CodexBackend) -> Result<Self> {
-        let transport = match backend {
+        let transport = match &backend {
             #[cfg(test)]
             CodexBackend::SpawnedStdio => CodexTransport::SpawnedStdio(connect_spawned_stdio()?),
             CodexBackend::SharedWebsocket { url } => {
-                CodexTransport::SharedWebsocket(WsJsonRpcTransport::connect(&url)?)
+                CodexTransport::SharedWebsocket(WsJsonRpcTransport::connect(url)?)
             }
         };
 
         let mut client = Self {
+            backend,
             transport,
             next_id: 1,
             notifications: Vec::new(),
+            server_requests: Vec::new(),
+            subscribe_to_active_threads: false,
+            subscribed_thread_ids: HashSet::new(),
             pending_transport_error: None,
             request_timeout: shared_websocket_request_timeout(),
             deadline: None,
@@ -1640,6 +1656,43 @@ impl CodexAppServerClient {
                 transport: "shared_websocket",
                 app_server_pid: None,
             },
+        }
+    }
+
+    pub(crate) fn matches_backend(&self, backend: &CodexBackend) -> bool {
+        &self.backend == backend
+    }
+
+    pub(crate) fn enable_active_thread_subscriptions(&mut self) {
+        self.subscribe_to_active_threads = true;
+    }
+
+    fn should_subscribe_to_active_threads(&self) -> bool {
+        self.subscribe_to_active_threads
+    }
+
+    fn ensure_thread_subscription(&mut self, thread_id: &str) -> Result<bool> {
+        if self.subscribed_thread_ids.contains(thread_id) {
+            return Ok(false);
+        }
+        match self.request("thread/resume", json!({ "threadId": thread_id })) {
+            Ok(_) => {
+                self.subscribed_thread_ids.insert(thread_id.to_string());
+                Ok(true)
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("no rollout found for thread id")
+                    || message.contains("is not materialized yet")
+                    || message.contains("includeTurns is unavailable before first user message")
+                {
+                    Ok(false)
+                } else {
+                    Err(error).with_context(|| {
+                        format!("failed to subscribe to active Codex thread {thread_id}")
+                    })
+                }
+            }
         }
     }
 
@@ -1695,7 +1748,12 @@ impl CodexAppServerClient {
 
         loop {
             let parsed = self.read_message_blocking(method, timeout)?;
-            if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
+            if let Some(result) = handle_app_server_message(
+                &parsed,
+                id,
+                &mut self.notifications,
+                &mut self.server_requests,
+            )? {
                 return Ok(result);
             }
         }
@@ -1703,12 +1761,68 @@ impl CodexAppServerClient {
 
     pub(crate) fn drain_notifications(&mut self) -> Vec<Value> {
         while let Some(parsed) = self.try_read_message() {
-            if parsed.get("id").is_none() && parsed.get("method").and_then(Value::as_str).is_some()
-            {
-                self.notifications.push(parsed);
-            }
+            route_unsolicited_app_server_message(
+                &parsed,
+                &mut self.notifications,
+                &mut self.server_requests,
+            );
         }
         std::mem::take(&mut self.notifications)
+    }
+
+    pub(crate) fn drain_server_requests(&mut self) -> Vec<Value> {
+        while let Some(parsed) = self.try_read_message() {
+            route_unsolicited_app_server_message(
+                &parsed,
+                &mut self.notifications,
+                &mut self.server_requests,
+            );
+        }
+        std::mem::take(&mut self.server_requests)
+    }
+
+    pub(crate) fn wait_for_server_request<F>(
+        &mut self,
+        timeout: Duration,
+        mut predicate: F,
+    ) -> Result<Option<Value>>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(index) = self.server_requests.iter().position(&mut predicate) {
+                return Ok(Some(self.server_requests.remove(index)));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match self.read_message_blocking("server request", remaining) {
+                Ok(parsed) => route_unsolicited_app_server_message(
+                    &parsed,
+                    &mut self.notifications,
+                    &mut self.server_requests,
+                ),
+                Err(error) if app_server_read_timed_out(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn respond_to_server_request(
+        &mut self,
+        request_id: &Value,
+        result: Value,
+    ) -> Result<()> {
+        if !request_id.is_string() && !request_id.is_i64() && !request_id.is_u64() {
+            bail!("app-server request id must be a string or integer");
+        }
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        }))
     }
 
     fn write_message(&mut self, value: &Value) -> Result<()> {
@@ -1870,11 +1984,257 @@ fn initialize_params() -> Value {
     })
 }
 
+fn route_unsolicited_app_server_message(
+    parsed: &Value,
+    notifications: &mut Vec<Value>,
+    server_requests: &mut Vec<Value>,
+) {
+    if parsed.get("method").and_then(Value::as_str).is_none() {
+        return;
+    }
+    if parsed.get("id").is_some() {
+        server_requests.push(parsed.clone());
+    } else {
+        notifications.push(parsed.clone());
+    }
+}
+
+fn app_server_read_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("timed out waiting for websocket JSON-RPC")
+    })
+}
+
+const APP_SERVER_COMMAND_APPROVAL_METHOD: &str = "item/commandExecution/requestApproval";
+const APP_SERVER_FILE_APPROVAL_METHOD: &str = "item/fileChange/requestApproval";
+const APP_SERVER_PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
+
+pub(crate) fn parse_app_server_approval_request(
+    message: &Value,
+) -> Result<Option<AppServerApprovalRequest>> {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(
+        method,
+        APP_SERVER_COMMAND_APPROVAL_METHOD
+            | APP_SERVER_FILE_APPROVAL_METHOD
+            | APP_SERVER_PERMISSIONS_APPROVAL_METHOD
+    ) {
+        return Ok(None);
+    }
+    let request_id = message
+        .get("id")
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .cloned()
+        .context("app-server approval request is missing a string or integer id")?;
+    let params = message
+        .get("params")
+        .filter(|params| params.is_object())
+        .cloned()
+        .context("app-server approval request is missing params")?;
+    let required_string = |field: &str| -> Result<String> {
+        params
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .with_context(|| format!("app-server approval request is missing {field}"))
+    };
+    let thread_id = required_string("threadId")?;
+    let turn_id = required_string("turnId")?;
+    let item_id = required_string("itemId")?;
+    let identity = json!({
+        "method": method,
+        "requestId": request_id,
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "itemId": item_id,
+        "approvalId": params.get("approvalId").cloned().unwrap_or(Value::Null),
+        "params": params,
+    });
+    let digest = crate::sha256_hex(serde_json::to_string(&identity)?.as_bytes());
+    Ok(Some(AppServerApprovalRequest {
+        approval_key: format!("approval_{}", &digest[..32]),
+        request_id,
+        method: method.to_string(),
+        thread_id,
+        turn_id,
+        item_id,
+        params,
+    }))
+}
+
+pub(crate) fn app_server_request_matches_approval(
+    message: &Value,
+    expected: &AppServerApprovalRequest,
+) -> bool {
+    parse_app_server_approval_request(message)
+        .ok()
+        .flatten()
+        .is_some_and(|actual| actual.approval_key == expected.approval_key)
+}
+
+pub(crate) fn app_server_approval_response(
+    request: &AppServerApprovalRequest,
+    action: TelegramCallbackAction,
+) -> Result<Value> {
+    match request.method.as_str() {
+        APP_SERVER_COMMAND_APPROVAL_METHOD | APP_SERVER_FILE_APPROVAL_METHOD => {
+            let decision = match action {
+                TelegramCallbackAction::Approve => "accept",
+                TelegramCallbackAction::ApproveForSession => "acceptForSession",
+                TelegramCallbackAction::Deny => "decline",
+            };
+            Ok(json!({ "decision": decision }))
+        }
+        APP_SERVER_PERMISSIONS_APPROVAL_METHOD => {
+            let permissions = match action {
+                TelegramCallbackAction::Approve | TelegramCallbackAction::ApproveForSession => {
+                    request
+                        .params
+                        .get("permissions")
+                        .cloned()
+                        .context("permissions approval request is missing permissions")?
+                }
+                TelegramCallbackAction::Deny => json!({}),
+            };
+            let scope = match action {
+                TelegramCallbackAction::ApproveForSession => "session",
+                TelegramCallbackAction::Approve | TelegramCallbackAction::Deny => "turn",
+            };
+            Ok(json!({ "permissions": permissions, "scope": scope }))
+        }
+        method => bail!("unsupported app-server approval method {method}"),
+    }
+}
+
+fn truncate_approval_detail(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let take = max_chars.saturating_sub(3);
+    format!("{}...", value.chars().take(take).collect::<String>())
+}
+
+fn app_server_approval_summary(request: &AppServerApprovalRequest, item: Option<&Value>) -> String {
+    let mut lines = Vec::new();
+    match request.method.as_str() {
+        APP_SERVER_COMMAND_APPROVAL_METHOD => {
+            if let Some(command) = request
+                .params
+                .get("command")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.and_then(|item| item.get("command"))
+                        .and_then(Value::as_str)
+                })
+            {
+                lines.push(format!(
+                    "Command:\n{}",
+                    truncate_approval_detail(command, 1600)
+                ));
+            } else if let Some(context) = request.params.get("networkApprovalContext") {
+                let host = context
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let protocol = context
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("network");
+                lines.push(format!("Network access: {protocol}://{host}"));
+            } else {
+                lines.push("Command execution requires approval.".to_string());
+            }
+        }
+        APP_SERVER_FILE_APPROVAL_METHOD => {
+            lines.push("Proposed file changes require approval.".to_string());
+            if let Some(changes) = item
+                .and_then(|item| item.get("changes"))
+                .and_then(Value::as_array)
+            {
+                for change in changes.iter().take(8) {
+                    let path = change
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown path");
+                    let kind = change
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("change");
+                    lines.push(format!("{kind}: {path}"));
+                    if let Some(diff) = change.get("diff").and_then(Value::as_str) {
+                        lines.push(truncate_approval_detail(diff, 1200));
+                    }
+                }
+                if changes.len() > 8 {
+                    lines.push(format!("...and {} more file changes", changes.len() - 8));
+                }
+            }
+            if let Some(root) = request.params.get("grantRoot").and_then(Value::as_str) {
+                lines.push(format!("Requested write root: {root}"));
+            }
+        }
+        APP_SERVER_PERMISSIONS_APPROVAL_METHOD => {
+            lines.push("Additional permissions requested:".to_string());
+            if let Some(permissions) = request.params.get("permissions") {
+                let rendered = serde_json::to_string_pretty(permissions)
+                    .unwrap_or_else(|_| permissions.to_string());
+                lines.push(truncate_approval_detail(&rendered, 1600));
+            }
+        }
+        _ => {}
+    }
+    if let Some(cwd) = request.params.get("cwd").and_then(Value::as_str) {
+        lines.push(format!("Working directory: {cwd}"));
+    }
+    if let Some(reason) = request.params.get("reason").and_then(Value::as_str) {
+        if !reason.trim().is_empty() {
+            lines.push(format!(
+                "Reason: {}",
+                truncate_approval_detail(reason.trim(), 800)
+            ));
+        }
+    }
+    truncate_approval_detail(&lines.join("\n"), 2800)
+}
+
+pub(crate) fn app_server_approval_event(
+    request: &AppServerApprovalRequest,
+    observed_at: u64,
+    item: Option<&Value>,
+) -> Value {
+    json!({
+        "type": "thread_waiting",
+        "eventKey": request.approval_key,
+        "threadId": request.thread_id,
+        "turnId": request.turn_id,
+        "itemId": request.item_id,
+        "promptKind": "approval",
+        "observedAt": observed_at,
+        "approvalRequest": {
+            "approvalKey": request.approval_key,
+            "method": request.method,
+            "requestId": request.request_id,
+            "turnId": request.turn_id,
+            "itemId": request.item_id,
+            "summary": app_server_approval_summary(request, item),
+        }
+    })
+}
+
 fn handle_app_server_message(
     parsed: &Value,
     expected_id: u64,
     notifications: &mut Vec<Value>,
+    server_requests: &mut Vec<Value>,
 ) -> Result<Option<Value>> {
+    if parsed.get("method").and_then(Value::as_str).is_some() {
+        route_unsolicited_app_server_message(parsed, notifications, server_requests);
+        return Ok(None);
+    }
     match parsed.get("id") {
         Some(value) if value == &json!(expected_id) => {
             if let Some(error) = parsed.get("error") {
@@ -1883,12 +2243,7 @@ fn handle_app_server_message(
             Ok(Some(parsed.get("result").cloned().unwrap_or(Value::Null)))
         }
         Some(_) => Ok(None),
-        None => {
-            if parsed.get("method").and_then(Value::as_str).is_some() {
-                notifications.push(parsed.clone());
-            }
-            Ok(None)
-        }
+        None => Ok(None),
     }
 }
 
@@ -1978,6 +2333,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
+                codex_home: None,
             }),
             ..missing
         };
@@ -2093,15 +2449,37 @@ mod tests {
     #[test]
     fn app_server_message_parser_preserves_notifications() {
         let mut notifications = Vec::new();
+        let mut server_requests = Vec::new();
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "item/completed",
             "params": { "threadId": "thr_1" }
         });
-        let parsed = handle_app_server_message(&notification, 7, &mut notifications)
-            .expect("notification parse");
+        let parsed =
+            handle_app_server_message(&notification, 7, &mut notifications, &mut server_requests)
+                .expect("notification parse");
         assert!(parsed.is_none());
         assert_eq!(notifications, vec![notification]);
+
+        let server_request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "startedAtMs": 42
+            }
+        });
+        let parsed =
+            handle_app_server_message(&server_request, 7, &mut notifications, &mut server_requests)
+                .expect("server request parse");
+        assert!(
+            parsed.is_none(),
+            "peer request id must not collide with response id"
+        );
+        assert_eq!(server_requests, vec![server_request]);
 
         let response = json!({
             "jsonrpc": "2.0",
@@ -2109,8 +2487,107 @@ mod tests {
             "result": { "ok": true }
         });
         let parsed =
-            handle_app_server_message(&response, 7, &mut notifications).expect("response parse");
+            handle_app_server_message(&response, 7, &mut notifications, &mut server_requests)
+                .expect("response parse");
         assert_eq!(parsed, Some(json!({ "ok": true })));
+    }
+
+    #[test]
+    fn app_server_approval_requests_map_to_typed_telegram_decisions() {
+        let command = parse_app_server_approval_request(&json!({
+            "id": 61,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "command": "git push",
+                "cwd": "/tmp/project",
+                "startedAtMs": 42
+            }
+        }))
+        .expect("parse command approval")
+        .expect("supported approval");
+        assert_eq!(
+            app_server_approval_response(&command, TelegramCallbackAction::Approve)
+                .expect("allow once"),
+            json!({ "decision": "accept" })
+        );
+        assert_eq!(
+            app_server_approval_response(&command, TelegramCallbackAction::ApproveForSession)
+                .expect("allow session"),
+            json!({ "decision": "acceptForSession" })
+        );
+        assert_eq!(
+            app_server_approval_response(&command, TelegramCallbackAction::Deny).expect("deny"),
+            json!({ "decision": "decline" })
+        );
+
+        let permissions = parse_app_server_approval_request(&json!({
+            "id": "permission-1",
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_2",
+                "cwd": "/tmp/project",
+                "permissions": {
+                    "network": { "enabled": true },
+                    "fileSystem": { "write": ["/tmp/project"] }
+                },
+                "startedAtMs": 43
+            }
+        }))
+        .expect("parse permissions approval")
+        .expect("supported approval");
+        assert_eq!(
+            app_server_approval_response(&permissions, TelegramCallbackAction::ApproveForSession,)
+                .expect("grant permissions"),
+            json!({
+                "scope": "session",
+                "permissions": {
+                    "network": { "enabled": true },
+                    "fileSystem": { "write": ["/tmp/project"] }
+                }
+            })
+        );
+        assert_eq!(
+            app_server_approval_response(&permissions, TelegramCallbackAction::Deny)
+                .expect("deny permissions"),
+            json!({ "scope": "turn", "permissions": {} })
+        );
+
+        let file = parse_app_server_approval_request(&json!({
+            "id": 62,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_3",
+                "startedAtMs": 44
+            }
+        }))
+        .expect("parse file approval")
+        .expect("supported approval");
+        let event = app_server_approval_event(
+            &file,
+            1000,
+            Some(&json!({
+                "id": "item_3",
+                "type": "fileChange",
+                "changes": [{
+                    "path": "/tmp/project/src/main.rs",
+                    "kind": "update",
+                    "diff": "+fn approved_change() {}"
+                }]
+            })),
+        );
+        let summary = event
+            .pointer("/approvalRequest/summary")
+            .and_then(Value::as_str)
+            .expect("file approval summary");
+        assert!(summary.contains("update: /tmp/project/src/main.rs"));
+        assert!(summary.contains("+fn approved_change() {}"));
     }
 
     #[cfg(unix)]
@@ -2336,6 +2813,131 @@ raise SystemExit(1)
         assert_eq!(requests[0]["method"], "initialize");
         assert_eq!(requests[1]["method"], "initialized");
         assert_eq!(requests[2]["method"], "thread/list");
+    }
+
+    #[test]
+    fn active_thread_subscription_captures_replayed_approval_with_colliding_id() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind approval subscription app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let url = format!("ws://{address}");
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept approval client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+            let mut messages = Vec::new();
+            loop {
+                let frame = socket.read().expect("read app-server message");
+                let message: Value =
+                    serde_json::from_str(&frame.into_text().expect("approval websocket text"))
+                        .expect("parse app-server message");
+                messages.push(message.clone());
+                let method = message.get("method").and_then(Value::as_str);
+                let id = message.get("id").cloned();
+                let result = match method {
+                    Some("initialize") => Some(json!({
+                        "protocolVersion": 1,
+                        "serverInfo": { "name": "fake-codex", "version": "test" }
+                    })),
+                    Some("initialized") => None,
+                    Some("thread/list") => Some(json!({
+                        "data": [{
+                            "id": "thr_active",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 42,
+                            "status": {
+                                "type": "active",
+                                "activeFlags": ["waitingOnApproval"]
+                            }
+                        }],
+                        "nextCursor": null
+                    })),
+                    Some("thread/resume") => {
+                        let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": id.clone().expect("resume id"),
+                            "result": { "thread": { "id": "thr_active" } }
+                        });
+                        socket
+                            .send(tungstenite::Message::text(response.to_string()))
+                            .expect("send resume response");
+                        socket
+                            .send(tungstenite::Message::text(
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 4,
+                                    "method": "item/commandExecution/requestApproval",
+                                    "params": {
+                                        "threadId": "thr_active",
+                                        "turnId": "turn_1",
+                                        "itemId": "item_1",
+                                        "command": "git push",
+                                        "startedAtMs": 42
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .expect("send replayed approval");
+                        None
+                    }
+                    Some("thread/read") => Some(json!({
+                        "thread": {
+                            "id": "thr_active",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 42,
+                            "status": {
+                                "type": "active",
+                                "activeFlags": ["waitingOnApproval"]
+                            },
+                            "turns": []
+                        }
+                    })),
+                    other => panic!("unexpected app-server method {other:?}"),
+                };
+                if let (Some(id), Some(result)) = (id, result) {
+                    socket
+                        .send(tungstenite::Message::text(
+                            json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+                        ))
+                        .expect("send app-server response");
+                }
+                if method == Some("thread/read") {
+                    break;
+                }
+            }
+            done_tx.send(messages).expect("send captured messages");
+        });
+
+        let mut client =
+            CodexAppServerClient::connect_with_backend(CodexBackend::SharedWebsocket { url })
+                .expect("connect approval client");
+        client.enable_active_thread_subscriptions();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        sync_state_from_live(&mut client, &conn, 1000, 10, false).expect("sync active thread");
+        let requests = client.drain_server_requests();
+        assert_eq!(requests.len(), 1);
+        let approval = parse_app_server_approval_request(&requests[0])
+            .expect("parse approval")
+            .expect("approval request");
+        assert_eq!(approval.thread_id, "thr_active");
+        assert_eq!(approval.request_id, json!(4));
+
+        let messages = done_rx.recv().expect("captured client messages");
+        server.join().expect("approval app-server thread");
+        let methods = messages
+            .iter()
+            .filter_map(|message| message.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "initialized",
+                "thread/list",
+                "thread/resume",
+                "thread/read"
+            ]
+        );
     }
 
     #[test]

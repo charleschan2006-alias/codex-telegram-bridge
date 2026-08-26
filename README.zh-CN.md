@@ -92,7 +92,8 @@ Telegram 通知和回复不需要 Hermes 配置。
 codex-telegram-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
-  --allowed-user-id <telegram-user-id>
+  --allowed-user-id <telegram-user-id> \
+  --codex-home /绝对路径/到/codex-home
 ```
 
 测试 Telegram 投递：
@@ -126,9 +127,9 @@ codex-telegram-bridge hermes install
 
 ## 工作原理
 
-`setup` 以仅当前用户权限写入 `~/.codex-telegram-bridge/config.json`，清除该 bot token 的任何现有 Telegram webhook，安装本地 daemon 服务（除非禁用），并可选择注册 Hermes MCP 服务器。
+`setup` 以仅当前用户权限写入 `~/.codex-telegram-bridge/config.json`，清除该 bot token 的任何现有 Telegram webhook，安装本地 daemon 服务（除非禁用），并可选择注册 Hermes MCP 服务器。如果未指定 `--codex-home`，setup 会保存当前用户的标准 Codex home（`~/.codex`）。daemon 会把保存的值传给它管理的 `codex app-server`，因此运行 `daemon run` 时不再需要另外设置 `CODEX_HOME` 环境变量。
 
-daemon 在本地运行。每个周期：
+daemon 在本地运行。它会保持一个 App Server 长连接、订阅活跃线程，并在每个周期：
 
 1. 通过配置的共享 websocket 后端同步 Codex 线程状态
 2. 检查本地 away 状态
@@ -136,13 +137,29 @@ daemon 在本地运行。每个周期：
 4. 将排队事件发送到 Telegram
 5. 处理 Telegram 更新和回复
 
-只要 daemon 在运行且共享实时后端可达，入站 Telegram 回复就会被处理。回复和审批处理会立即启动 Codex turn；完成的答案由下一次 daemon 同步拾取，并通过正常的出站通知路径投递。away 门控只控制出站通知。
+只要 daemon 在运行且共享实时后端可达，入站 Telegram 回复就会被处理。普通回复会启动 Codex turn 并立即返回；原生审批按钮则会响应携带精确 thread、turn、item 和 request id 的 App Server JSON-RPC 请求，而不会再新建一个内容为 `YES`/`NO` 的 turn。完成的答案由下一次 daemon 同步拾取，并通过正常的出站通知路径投递。away 门控只控制出站通知。
 
-当入站回复、审批或远程 `/new` 提示启动 Codex turn 时，daemon 会刷新平台的打字指示器，让 Telegram 显示 bot 正在工作，直到答案投递或短时打字窗口过期。
+当入站回复、已接受的审批或远程 `/new` 提示让 Codex turn 继续运行时，daemon 会刷新平台的打字指示器，让 Telegram 显示 bot 正在工作，直到答案投递或短时打字窗口过期。
 
 Telegram 通知使用紧凑的头部，原样保留 Codex 的答案正文，并省略内部线程 id。要远程继续对话，请对具体的 Codex 通知使用 Telegram 的 Reply 操作。
 
 在 Telegram 中使用 `/threads` 获取最近 5 个 Codex 线程，或使用 `/threads 10` 指定数量。bridge 对每个线程发送一条使用相同紧凑更新模板的 Telegram 消息，在本地记录每个消息 id，并将回复路由回匹配的 Codex 线程。
+
+### 远程 CLI 审批
+
+要让交互式 Codex CLI 产生的审批出现在 Telegram 中，该 CLI 必须连接到 bridge 所使用的同一个 App Server。新建远程 TUI 或恢复已知线程时使用：
+
+```bash
+CODEX_HOME=/绝对路径/到/codex-home \
+codex --remote ws://127.0.0.1:4500
+
+CODEX_HOME=/绝对路径/到/codex-home \
+codex resume --remote ws://127.0.0.1:4500 <thread-id>
+```
+
+URL 必须与 `codex.websocketUrl` 一致，受管 App Server 也必须使用目标 `codex.codexHome`。能在 `/threads` 中看到线程，只表示已保存的 rollout 可见，并不表示按普通方式启动的 CLI 进程已连接到这个 App Server。依赖 Telegram 审批前，应退出该 CLI，并用 `--remote` 恢复。
+
+原生审批通知提供“允许一次”“本会话允许”和“拒绝”三个按钮。每个按钮只绑定一个未决 App Server 请求；如果另一个客户端先作答，或 turn 已结束，后续点击会安全地显示为已过期。
 
 如果回复无法到达 Codex，请在 Telegram 中发送 `/repair`。它会在配置的 websocket URL 上重启共享本地后端并保持远程模式开启。
 
@@ -165,6 +182,7 @@ codex-telegram-bridge doctor
 - `--chat-id <id>`：跳过 `/start` 配对
 - `--allowed-user-id <id>`：将入站回复/按钮限制为单个 Telegram 用户
 - `--websocket-url <url>`：设置环回共享 Codex 后端 URL，默认 `ws://127.0.0.1:4500`
+- `--codex-home <绝对路径>`：选择受管 App Server 使用的 Codex 状态目录，默认 `~/.codex`
 - `--no-install-daemon`：只写配置，不安装服务
 - `--no-start-daemon`：安装但不启动服务
 - `--register-hermes`：同时运行 `hermes mcp add`

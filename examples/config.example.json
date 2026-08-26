@@ -1,11 +1,16 @@
 {
-  "version": 3,
+  "version": 5,
   "bridgeCommand": "/absolute/path/to/codex-telegram-bridge",
   "events": "thread_waiting,thread_completed",
   "telegram": {
     "botToken": "<telegram-bot-token>",
     "chatId": "<telegram-chat-id>",
     "allowedUserId": "<telegram-user-id>"
+  },
+  "codex": {
+    "liveMode": "shared",
+    "websocketUrl": "ws://127.0.0.1:4500",
+    "codexHome": "/absolute/path/to/codex-home"
   },
   "projects": [
     {
