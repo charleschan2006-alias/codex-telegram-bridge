@@ -27,6 +27,12 @@ pub(crate) enum Commands {
         bridge_command: String,
         #[arg(long, default_value = crate::DEFAULT_CODEX_WEBSOCKET_URL)]
         websocket_url: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Codex state directory (default: ~/.codex)"
+        )]
+        codex_home: Option<String>,
         #[arg(long, default_value = crate::DEFAULT_DAEMON_LABEL)]
         daemon_label: String,
         #[arg(long = "no-install-daemon", default_value_t = true, action = clap::ArgAction::SetFalse)]
@@ -347,6 +353,12 @@ pub(crate) enum TelegramCommands {
         bridge_command: String,
         #[arg(long, default_value = crate::DEFAULT_CODEX_WEBSOCKET_URL)]
         websocket_url: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Codex state directory (default: ~/.codex)"
+        )]
+        codex_home: Option<String>,
         #[arg(long, default_value_t = 60_000)]
         pair_timeout_ms: u64,
         #[arg(long, default_value_t = false)]
@@ -533,6 +545,8 @@ mod tests {
             "456",
             "--websocket-url",
             "ws://127.0.0.1:4500",
+            "--codex-home",
+            "/tmp/codex-home",
             "--dry-run",
         ])
         .expect("telegram setup should parse");
@@ -541,11 +555,13 @@ mod tests {
                 command:
                     TelegramCommands::Setup {
                         websocket_url,
+                        codex_home,
                         dry_run,
                         ..
                     },
             } => {
                 assert_eq!(websocket_url, "ws://127.0.0.1:4500");
+                assert_eq!(codex_home.as_deref(), Some("/tmp/codex-home"));
                 assert!(dry_run);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -637,6 +653,8 @@ mod tests {
             "789",
             "--websocket-url",
             "ws://127.0.0.1:4500",
+            "--codex-home",
+            "/tmp/codex-home",
             "--no-install-daemon",
             "--no-start-daemon",
             "--dry-run",
@@ -645,12 +663,14 @@ mod tests {
         match parsed.command {
             Commands::Setup {
                 websocket_url,
+                codex_home,
                 install_daemon,
                 start_daemon,
                 dry_run,
                 ..
             } => {
                 assert_eq!(websocket_url, "ws://127.0.0.1:4500");
+                assert_eq!(codex_home.as_deref(), Some("/tmp/codex-home"));
                 assert!(!install_daemon);
                 assert!(!start_daemon);
                 assert!(dry_run);

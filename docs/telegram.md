@@ -9,7 +9,7 @@ The intended behavior:
 - `/back` disables outbound Telegram notifications
 - `/threads` sends recent Codex threads as reply-routable Telegram messages
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
-- approval messages include `Approve` and `Deny` buttons
+- native App Server approval messages include `Allow once`, `Allow session`, and `Deny` buttons
 - slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
 
 Hermes can still control Codex through MCP when you ask it to, but Hermes and MCP do not own Telegram delivery.
@@ -37,10 +37,11 @@ For non-interactive setup:
 codex-telegram-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
-  --allowed-user-id <telegram-user-id>
+  --allowed-user-id <telegram-user-id> \
+  --codex-home /absolute/path/to/codex-home
 ```
 
-The token can also come from `TELEGRAM_BOT_TOKEN`. Setup stores the shared Codex backend URL as `codex.websocketUrl`; by default it is `ws://127.0.0.1:4500`.
+The token can also come from `TELEGRAM_BOT_TOKEN`. Setup stores the shared Codex backend URL as `codex.websocketUrl`; by default it is `ws://127.0.0.1:4500`. It stores the App Server state directory as `codex.codexHome`; omitting `--codex-home` resolves it to the current user's standard `~/.codex`. The daemon passes that value to the managed App Server, so do not prefix `daemon run` with `CODEX_HOME`.
 
 For manual recovery or first-run audits, sample files live at:
 
@@ -58,7 +59,8 @@ codex-telegram-bridge telegram setup --bot-token <telegram-bot-token>
 codex-telegram-bridge telegram setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
-  --allowed-user-id <telegram-user-id>
+  --allowed-user-id <telegram-user-id> \
+  --codex-home /absolute/path/to/codex-home
 ```
 
 `telegram setup` clears any existing Telegram webhook for that bot token because the daemon uses local long polling for replies and button callbacks.
@@ -117,7 +119,7 @@ codex-telegram-bridge daemon start
 
 `/back` clears pending outbound notifications so delayed retries do not notify you after you return.
 
-Inbound Telegram replies and button callbacks are processed whenever the daemon is running. They start the Codex turn and return immediately; the daemon's next sync observes the completed turn and delivers the answer through the normal outbound notification path. The away state only controls outbound notifications.
+Inbound Telegram replies and button callbacks are processed whenever the daemon is running. Replies start a Codex turn and return immediately. Approval callbacks answer the original App Server JSON-RPC request and let its existing turn continue. The daemon's next sync observes the completed turn and delivers the answer through the normal outbound notification path. The away state only controls outbound notifications.
 
 ## Reply Flow
 
@@ -125,7 +127,23 @@ When Codex needs attention and you are away, the daemon sends a Telegram message
 
 After a Telegram reply, approval callback, or `/new` prompt starts a Codex turn, the daemon refreshes Telegram's `typing` chat action until the answer is delivered or the short-lived typing window expires.
 
-For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
+For native approval prompts, use `Allow once`, `Allow session`, or `Deny`. The callback data contains only an opaque route id. The exact App Server request id plus its thread, turn, and item ids stay in the local SQLite route table. Duplicate taps are ignored, and a request already answered by another App Server client is reported as expired.
+
+## Interactive CLI Approval Flow
+
+The daemon keeps a long-lived App Server connection and subscribes to active threads. Codex App Server replays pending server requests to a client when it resumes a loaded thread, which lets the bridge render and resolve the exact approval request.
+
+The interactive CLI must use the same App Server endpoint:
+
+```bash
+CODEX_HOME=/absolute/path/to/codex-home \
+codex --remote ws://127.0.0.1:4500
+
+CODEX_HOME=/absolute/path/to/codex-home \
+codex resume --remote ws://127.0.0.1:4500 <thread-id>
+```
+
+Use the URL configured as `codex.websocketUrl`. A thread appearing in `/threads` is not enough: saved threads can be listed from the configured Codex home even when the currently running CLI owns a separate local runtime. A CLI that was started without `--remote` must be exited and resumed with `--remote`; the bridge cannot retroactively attach that process.
 
 ## Recent Threads From Telegram
 
@@ -158,7 +176,7 @@ Approval messages use a compact approval header and a button-aware footer:
 
 <approval prompt verbatim>
 
-Use the buttons below, or use Telegram's Reply action on this message.
+Choose one option below. The button is bound to this exact Codex request.
 ```
 
 Codex app directives such as `::inbox-item{...}` are not stripped or summarized. They are part of the Codex answer body, so Telegram receives the same final answer that appears in the Codex app.
@@ -236,7 +254,7 @@ The bridge does not keep historical token versions. Once the config file is repl
 The local bridge state lives under `~/.codex-telegram-bridge/` and typically contains:
 
 - `config.json`: bridge transport config and project registry
-- `state.db`: cached thread metadata, message routing ids, inbound update dedupe, and other local bridge state
+- `state.db`: cached thread metadata, exact pending App Server approval metadata, message routing ids, inbound update dedupe, and other local bridge state
 - `daemon.out.log` and `daemon.err.log`: daemon logs
 
 Retention is local and indefinite until you delete or replace those files.

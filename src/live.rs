@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codex::{resolve_codex_binary, CodexAppServerClient, CodexBackend};
-use crate::config::CodexConfig;
+use crate::config::{effective_codex_home, CodexConfig};
 use crate::state::live_backend_status_path;
 use crate::ws::validate_shared_websocket_url;
 
@@ -33,6 +33,8 @@ pub(crate) const LIVE_BACKEND_STATE_BLOCKED: &str = "blocked";
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveBackendStatus {
     pub(crate) websocket_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_home: Option<String>,
     pub(crate) pid: Option<u32>,
     #[serde(default)]
     pub(crate) process_start_key: Option<String>,
@@ -216,9 +218,7 @@ pub(crate) fn terminate_recorded_live_backend() -> Result<Option<u32>> {
         }
         Ok(None) => {}
         Err(error) => {
-            eprintln!(
-                "reset: ignoring unreadable live backend status: {error:#}"
-            );
+            eprintln!("reset: ignoring unreadable live backend status: {error:#}");
         }
     }
     Ok(recorded_pid)
@@ -226,6 +226,7 @@ pub(crate) fn terminate_recorded_live_backend() -> Result<Option<u32>> {
 
 #[allow(dead_code)]
 fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<LiveBackendStatus> {
+    let configured_codex_home = effective_codex_home(config)?;
     let previous_status = read_live_backend_status()?;
     let mut status = previous_status
         .clone()
@@ -248,6 +249,29 @@ fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<
         None => false,
     };
 
+    if recorded_pid_matches
+        && config.codex_home.is_some()
+        && status.codex_home.as_deref() != Some(configured_codex_home.as_str())
+    {
+        let previous_codex_home = status
+            .codex_home
+            .as_deref()
+            .unwrap_or("<unknown>")
+            .to_string();
+        set_status_state(
+            &mut status,
+            required,
+            LIVE_BACKEND_STATE_UNHEALTHY,
+            false,
+            true,
+            Some(format!(
+                "configured CODEX_HOME changed from {previous_codex_home} to {configured_codex_home}; managed live backend restart required"
+            )),
+        );
+        write_live_backend_status(&status)?;
+        return Ok(status);
+    }
+
     if !recorded_pid_matches {
         if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
             status.pid = Some(pid);
@@ -256,6 +280,7 @@ fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<
             status.pid = None;
             status.process_start_key = None;
         }
+        status.codex_home = Some(configured_codex_home);
     }
 
     let managed_pid_matches = match status.pid {
@@ -345,6 +370,7 @@ fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<
 fn empty_live_backend_status(config: &CodexConfig) -> LiveBackendStatus {
     LiveBackendStatus {
         websocket_url: config.websocket_url.clone(),
+        codex_home: effective_codex_home(config).ok(),
         pid: None,
         process_start_key: None,
         healthy: false,
@@ -432,6 +458,7 @@ fn start_live_backend(config: &CodexConfig, action: &str) -> Result<EnsureLiveBa
 #[allow(dead_code)]
 fn validate_live_backend_config(config: &CodexConfig) -> Result<()> {
     validate_shared_websocket_url(&config.websocket_url)?;
+    effective_codex_home(config)?;
     Ok(())
 }
 
@@ -463,6 +490,7 @@ fn wait_for_live_backend(
             Ok(()) => {
                 let status = LiveBackendStatus {
                     websocket_url: config.websocket_url.clone(),
+                    codex_home: Some(effective_codex_home(config)?),
                     pid: Some(pid),
                     process_start_key: Some(process_start_key.to_string()),
                     healthy: true,
@@ -486,6 +514,7 @@ fn wait_for_live_backend(
     terminate_managed_backend_pid(pid, &config.websocket_url, Some(process_start_key));
     let status = LiveBackendStatus {
         websocket_url: config.websocket_url.clone(),
+        codex_home: Some(effective_codex_home(config)?),
         pid: Some(pid),
         process_start_key: Some(process_start_key.to_string()),
         healthy: false,
@@ -604,7 +633,9 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
             return spawn_live_backend_with_screen(config, &resolved.path);
         }
 
-        let output = Command::new("sh")
+        let mut command = Command::new("sh");
+        apply_codex_home_env(&mut command, config)?;
+        let output = command
             .arg("-c")
             .arg(live_backend_spawn_shell_script())
             .arg("codex-live-backend")
@@ -635,7 +666,9 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
 
     #[cfg(not(unix))]
     {
-        let child = Command::new(&resolved.path)
+        let mut command = Command::new(&resolved.path);
+        apply_codex_home_env(&mut command, config)?;
+        let child = command
             .arg("app-server")
             .arg("--listen")
             .arg(&config.websocket_url)
@@ -664,7 +697,9 @@ fn unix_command_exists(command: &str) -> bool {
 #[cfg(unix)]
 fn spawn_live_backend_with_screen(config: &CodexConfig, binary: &Path) -> Result<u32> {
     let session_name = live_backend_screen_session_name(&config.websocket_url);
-    let status = Command::new("screen")
+    let mut command = Command::new("screen");
+    apply_codex_home_env(&mut command, config)?;
+    let status = command
         .arg("-dmS")
         .arg(&session_name)
         .arg(binary)
@@ -693,6 +728,11 @@ fn spawn_live_backend_with_screen(config: &CodexConfig, binary: &Path) -> Result
         "screen launched session {session_name}, but no codex app-server process appeared for {}",
         config.websocket_url
     )
+}
+
+fn apply_codex_home_env(command: &mut Command, config: &CodexConfig) -> Result<()> {
+    command.env("CODEX_HOME", effective_codex_home(config)?);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1392,6 +1432,7 @@ mod tests {
         CodexConfig {
             live_mode: crate::CodexLiveMode::Shared,
             websocket_url: websocket_url.to_string(),
+            codex_home: None,
         }
     }
 
@@ -1522,6 +1563,26 @@ mod tests {
     }
 
     #[test]
+    fn app_server_command_receives_configured_codex_home() {
+        let codex_home = std::env::temp_dir().join("configured-codex-home");
+        let config = CodexConfig {
+            live_mode: crate::CodexLiveMode::Shared,
+            websocket_url: crate::DEFAULT_CODEX_WEBSOCKET_URL.to_string(),
+            codex_home: Some(codex_home.display().to_string()),
+        };
+        let mut command = Command::new("codex");
+
+        apply_codex_home_env(&mut command, &config).expect("apply CODEX_HOME");
+
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| value)
+            .expect("CODEX_HOME command environment");
+        assert_eq!(value, codex_home.as_os_str());
+    }
+
+    #[test]
     fn ensure_live_backend_reuses_healthy_backend() {
         let _guard = live_test_lock().lock().expect("live test lock");
         let _home = TempHome::new("reuse");
@@ -1534,6 +1595,7 @@ mod tests {
         wait_until_healthy(&websocket_url);
         let initial = LiveBackendStatus {
             websocket_url: websocket_url.clone(),
+            codex_home: None,
             pid: Some(pid),
             process_start_key: None,
             healthy: true,
@@ -1560,6 +1622,41 @@ mod tests {
     }
 
     #[test]
+    fn ensure_live_backend_restarts_when_codex_home_changes() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let home = TempHome::new("codex-home-change");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+        let first_codex_home = home.root.join("codex-first").display().to_string();
+        let second_codex_home = home.root.join("codex-second").display().to_string();
+        let first_config = CodexConfig {
+            live_mode: crate::CodexLiveMode::Shared,
+            websocket_url: websocket_url.clone(),
+            codex_home: Some(first_codex_home),
+        };
+        let second_config = CodexConfig {
+            live_mode: crate::CodexLiveMode::Shared,
+            websocket_url: websocket_url.clone(),
+            codex_home: Some(second_codex_home.clone()),
+        };
+
+        let first = ensure_live_backend(&first_config).expect("start first backend");
+        let first_pid = first.status.pid.expect("first backend pid");
+        let second = ensure_live_backend(&second_config).expect("replace backend");
+        let second_pid = second.status.pid.expect("second backend pid");
+
+        assert_eq!(second.action, "started");
+        assert_ne!(second_pid, first_pid);
+        assert_eq!(
+            second.status.codex_home.as_deref(),
+            Some(second_codex_home.as_str())
+        );
+        assert!(!backend_pid_is_alive(first_pid));
+
+        terminate_backend_pid(second_pid);
+    }
+
+    #[test]
     fn reset_live_backend_restarts_unhealthy_backend() {
         let _guard = live_test_lock().lock().expect("live test lock");
         let _home = TempHome::new("reset");
@@ -1568,6 +1665,7 @@ mod tests {
 
         write_live_backend_status(&LiveBackendStatus {
             websocket_url: websocket_url.clone(),
+            codex_home: None,
             pid: Some(41_242),
             process_start_key: Some("stale-test-process".to_string()),
             healthy: false,
@@ -1634,6 +1732,7 @@ mod tests {
         let dead_pid = healthy_pid + 1;
         write_live_backend_status(&LiveBackendStatus {
             websocket_url: websocket_url.clone(),
+            codex_home: None,
             pid: Some(dead_pid),
             process_start_key: Some("dead-test-process".to_string()),
             healthy: true,
@@ -1711,6 +1810,7 @@ mod tests {
         wait_until_healthy(&websocket_url);
         write_live_backend_status(&LiveBackendStatus {
             websocket_url: websocket_url.clone(),
+            codex_home: None,
             pid: Some(old_pid),
             process_start_key: None,
             healthy: true,
@@ -1810,6 +1910,7 @@ mod tests {
         wait_until_healthy(&current_url);
         write_live_backend_status(&LiveBackendStatus {
             websocket_url: stale_recorded_url,
+            codex_home: None,
             pid: Some(current_pid),
             process_start_key: backend_process_start_key(current_pid),
             healthy: false,
@@ -1899,6 +2000,7 @@ mod tests {
         let websocket_url = random_websocket_url();
         let initial = LiveBackendStatus {
             websocket_url: websocket_url.clone(),
+            codex_home: None,
             pid: Some(1),
             process_start_key: None,
             healthy: false,
@@ -1911,6 +2013,7 @@ mod tests {
         };
         let updated = LiveBackendStatus {
             websocket_url,
+            codex_home: None,
             pid: Some(2),
             process_start_key: None,
             healthy: true,

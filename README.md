@@ -92,7 +92,8 @@ For non-interactive setup:
 codex-telegram-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
-  --allowed-user-id <telegram-user-id>
+  --allowed-user-id <telegram-user-id> \
+  --codex-home /absolute/path/to/codex-home
 ```
 
 Test Telegram delivery:
@@ -126,9 +127,9 @@ Restart Hermes after registration so it reconnects to MCP servers and discovers 
 
 ## How It Works
 
-`setup` writes `~/.codex-telegram-bridge/config.json` with user-only permissions, clears any existing Telegram webhook for the bot token, installs the local daemon service unless disabled, and can optionally register the Hermes MCP server.
+`setup` writes `~/.codex-telegram-bridge/config.json` with user-only permissions, clears any existing Telegram webhook for the bot token, installs the local daemon service unless disabled, and can optionally register the Hermes MCP server. If `--codex-home` is omitted, setup stores the standard Codex home for the current user (`~/.codex`). The daemon passes the stored value to the managed `codex app-server`, so `daemon run` does not need a separate `CODEX_HOME` environment variable.
 
-The daemon runs locally. Each cycle:
+The daemon runs locally. It keeps one App Server connection open, subscribes to active threads, and each cycle:
 
 1. syncs Codex thread state through the configured shared websocket backend
 2. checks the local away state
@@ -136,13 +137,29 @@ The daemon runs locally. Each cycle:
 4. sends queued events to Telegram
 5. processes Telegram updates and replies
 
-Inbound Telegram replies are processed whenever the daemon is running and the shared live backend is reachable. Reply and approval handling starts the Codex turn and returns immediately; completed answers are picked up by the next daemon sync and delivered through the normal outbound notification path. The away gate only controls outbound notifications.
+Inbound Telegram replies are processed whenever the daemon is running and the shared live backend is reachable. Replies start a Codex turn and return immediately. Native approval buttons instead answer the exact App Server JSON-RPC request that supplied the thread, turn, item, and request ids; they do not start a `YES`/`NO` turn. Completed answers are picked up by the next daemon sync and delivered through the normal outbound notification path. The away gate only controls outbound notifications.
 
-When an inbound reply, approval, or remote `/new` prompt starts a Codex turn, the daemon refreshes the platform typing indicator so Telegram shows that the bot is working until the answer is delivered or the short-lived typing window expires.
+When an inbound reply, accepted approval, or remote `/new` prompt lets a Codex turn proceed, the daemon refreshes the platform typing indicator so Telegram shows that the bot is working until the answer is delivered or the short-lived typing window expires.
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
 
 Use `/threads` in Telegram to fetch the 5 most recent Codex threads, or `/threads 10` to choose a count. The bridge sends one Telegram message per thread using the same compact update template, records each message id locally, and routes replies back to the matching Codex thread.
+
+### Remote CLI Approvals
+
+For approvals raised by an interactive Codex CLI to appear in Telegram, that CLI must be connected to the same App Server as the bridge. Start a new remote TUI or resume a known thread with:
+
+```bash
+CODEX_HOME=/absolute/path/to/codex-home \
+codex --remote ws://127.0.0.1:4500
+
+CODEX_HOME=/absolute/path/to/codex-home \
+codex resume --remote ws://127.0.0.1:4500 <thread-id>
+```
+
+The URL must match `codex.websocketUrl`, and the configured App Server must use the intended `codex.codexHome`. Seeing a thread in `/threads` only proves that its saved rollout is visible; it does not attach a conventionally started CLI process to this App Server. Exit and resume that CLI with `--remote` before relying on Telegram approvals.
+
+Native approval notifications offer `Allow once`, `Allow session`, and `Deny`. Each button is bound to one pending App Server request. If another client answers first, or the turn ends, later taps are rejected as expired.
 
 If replies stop reaching Codex, send `/repair` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps remote mode on.
 
@@ -165,6 +182,7 @@ Useful setup flags:
 - `--chat-id <id>`: skip `/start` pairing
 - `--allowed-user-id <id>`: restrict inbound replies/buttons to one Telegram user
 - `--websocket-url <url>`: set the loopback shared Codex backend URL, default `ws://127.0.0.1:4500`
+- `--codex-home <absolute-path>`: select the Codex state directory used by the managed App Server, default `~/.codex`
 - `--no-install-daemon`: write config without installing a service
 - `--no-start-daemon`: install without starting the service
 - `--register-hermes`: also run `hermes mcp add`

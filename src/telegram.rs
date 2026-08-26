@@ -8,28 +8,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codex::{
-    normalized_message, set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
+    app_server_approval_response, app_server_request_matches_approval, normalized_message,
+    set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
     CodexAppServerClient,
 };
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
-    delete_setting, get_setting_number, get_telegram_current_project_id,
-    insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
-    list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_telegram_callback_route_used,
-    mark_telegram_command_route_used, observed_workspaces_from_db, record_action,
-    record_telegram_inbound_processed, set_setting, set_setting_text,
-    set_telegram_current_project_id, telegram_inbound_processed,
+    delete_setting, expire_app_server_approval, get_setting_number,
+    get_telegram_current_project_id, insert_telegram_callback_route, insert_telegram_command_route,
+    insert_telegram_message_route, list_recent_thread_snapshots_from_db,
+    lookup_pending_app_server_approval, lookup_telegram_command_route,
+    lookup_telegram_message_route, mark_app_server_approval_responded,
+    mark_telegram_callback_route_used, mark_telegram_command_route_used,
+    observed_workspaces_from_db, record_action, record_telegram_inbound_processed, set_setting,
+    set_setting_text, set_telegram_current_project_id, telegram_inbound_processed,
     update_telegram_callback_message_id, BridgeThreadSnapshot, TelegramCallbackAction,
     TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::ws::validate_shared_websocket_url;
 use crate::{
     daemon_config_path, ensure_live_backend, load_daemon_config, merged_daemon_config,
-    read_daemon_config_raw, redacted_daemon_config, reset_live_backend, resolve_telegram_bot_token,
-    write_daemon_config, CodexConfig, CodexLiveMode, DaemonConfig, RegisteredProject,
-    TelegramConfig, TelegramSetupOptions,
+    read_daemon_config_raw, redacted_daemon_config, reset_live_backend, resolve_codex_home,
+    resolve_telegram_bot_token, write_daemon_config, CodexConfig, CodexLiveMode, DaemonConfig,
+    RegisteredProject, TelegramConfig, TelegramSetupOptions,
 };
 
 use self::api::{
@@ -84,6 +86,7 @@ pub(crate) struct RoutedTelegramCallback {
     pub(crate) callback_id: String,
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
+    pub(crate) approval_key: Option<String>,
 }
 
 pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
@@ -102,6 +105,8 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
     }
     validate_shared_websocket_url(websocket_url)
         .context("telegram setup websocket url is invalid")?;
+    let codex_home =
+        resolve_codex_home(options.codex_home).context("telegram setup Codex home is invalid")?;
     if !options.dry_run {
         telegram_delete_webhook(&bot_token, Duration::from_secs(10))
             .context("failed to clear existing Telegram webhook before enabling long polling")?;
@@ -144,6 +149,7 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
         CodexConfig {
             live_mode: CodexLiveMode::Shared,
             websocket_url: websocket_url.to_string(),
+            codex_home: Some(codex_home),
         },
     );
     let commands = telegram_bot_commands();
@@ -471,20 +477,30 @@ pub(crate) fn extract_telegram_callback_route(
     else {
         return Ok(None);
     };
+    let chat_id = chat_id.context("callback query missing authorized chat id")?;
+    let message_id = message.and_then(telegram_message_id);
     let route = conn
         .query_row(
-            "SELECT thread_id, action FROM telegram_callback_routes
-             WHERE callback_id = ?1 AND used_at IS NULL",
-            params![callback_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT thread_id, action, approval_key FROM telegram_callback_routes
+             WHERE callback_id = ?1 AND chat_id = ?2 AND used_at IS NULL
+               AND (message_id IS NULL OR message_id = ?3)",
+            params![callback_id, chat_id, message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(route.and_then(|(thread_id, action)| {
+    Ok(route.and_then(|(thread_id, action, approval_key)| {
         TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
             callback_query_id: callback_query_id.to_string(),
             callback_id: callback_id.to_string(),
             thread_id,
             action,
+            approval_key,
         })
     }))
 }
@@ -739,7 +755,84 @@ fn send_codex_reply_to_thread(
     }))
 }
 
-fn send_codex_approval_to_thread(
+fn send_native_codex_approval(
+    conn: &Connection,
+    config: &DaemonConfig,
+    approval_key: &str,
+    action: TelegramCallbackAction,
+    now: u64,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>> {
+    let Some(request) = lookup_pending_app_server_approval(conn, approval_key)? else {
+        return Ok(None);
+    };
+    let mut client = CodexAppServerClient::connect_configured(config)?;
+    if let Some(deadline) = deadline {
+        client.set_deadline(deadline);
+    }
+    let transport = client.transport_info();
+    let resumed = match client.request("thread/resume", json!({ "threadId": request.thread_id })) {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            let message = format!("{error:#}");
+            if message.contains("no rollout found for thread id")
+                || message.contains("thread not loaded")
+                || message.contains("thread not found")
+            {
+                expire_app_server_approval(conn, approval_key, now)?;
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
+    let replayed = client.wait_for_server_request(Duration::from_secs(2), |message| {
+        app_server_request_matches_approval(message, &request)
+    })?;
+    if replayed.is_none() {
+        expire_app_server_approval(conn, approval_key, now)?;
+        return Ok(None);
+    }
+
+    let response = app_server_approval_response(&request, action)?;
+    client.respond_to_server_request(&request.request_id, response.clone())?;
+    mark_app_server_approval_responded(conn, approval_key, now)?;
+    record_action(
+        conn,
+        &request.thread_id,
+        "telegram_app_server_approval",
+        json!({
+            "approvalKey": approval_key,
+            "requestId": request.request_id,
+            "method": request.method,
+            "turnId": request.turn_id,
+            "itemId": request.item_id,
+            "decision": action.as_str(),
+            "response": response,
+            "resumed": resumed,
+            "sentAt": now,
+        }),
+        now,
+    )?;
+    if let Some(telegram) = config.telegram.as_ref() {
+        register_telegram_typing_indicator(conn, telegram, &request.thread_id, now)?;
+    }
+    Ok(Some(json!({
+        "ok": true,
+        "action": "telegram_app_server_approval",
+        "threadId": request.thread_id,
+        "turnId": request.turn_id,
+        "itemId": request.item_id,
+        "approvalKey": approval_key,
+        "decision": action.as_str(),
+        "codex": {
+            "transport": transport.transport,
+            "appServerPid": transport.app_server_pid,
+        },
+        "sentAt": now,
+    })))
+}
+
+fn send_legacy_codex_approval_to_thread(
     conn: &Connection,
     config: &DaemonConfig,
     thread_id: &str,
@@ -748,7 +841,7 @@ fn send_codex_approval_to_thread(
     deadline: Option<Instant>,
 ) -> Result<Value> {
     let sent_text = match action {
-        TelegramCallbackAction::Approve => "YES",
+        TelegramCallbackAction::Approve | TelegramCallbackAction::ApproveForSession => "YES",
         TelegramCallbackAction::Deny => "NO",
     };
     let mut client = CodexAppServerClient::connect_configured(config)?;
@@ -1452,6 +1545,7 @@ fn advance_telegram_ack_offset(max_acked: &mut Option<i64>, update_id: Option<i6
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_telegram_update_batch(
     conn: &Connection,
     config: &DaemonConfig,
@@ -1482,7 +1576,7 @@ fn process_telegram_update_batch(
         seen += 1;
         let update_id = update.get("update_id").and_then(Value::as_i64);
         if let Some(update_id) = update_id {
-            if telegram_inbound_processed(conn, &bot_id, update_id)? {
+            if telegram_inbound_processed(conn, bot_id, update_id)? {
                 duplicate += 1;
                 advance_telegram_ack_offset(&mut max_acked_update_id, Some(update_id));
                 continue;
@@ -1505,7 +1599,7 @@ fn process_telegram_update_batch(
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
-                            &bot_id,
+                            bot_id,
                             update_id,
                             "telegram_reply",
                             &result,
@@ -1527,7 +1621,7 @@ fn process_telegram_update_batch(
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
-                            &bot_id,
+                            bot_id,
                             update_id,
                             "telegram_command_prompt_reply",
                             &result,
@@ -1562,7 +1656,7 @@ fn process_telegram_update_batch(
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
-                            &bot_id,
+                            bot_id,
                             update_id,
                             "telegram_command",
                             &result,
@@ -1579,7 +1673,7 @@ fn process_telegram_update_batch(
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
-                            &bot_id,
+                            bot_id,
                             update_id,
                             "message_ignored",
                             &json!({ "ignored": true }),
@@ -1599,46 +1693,111 @@ fn process_telegram_update_batch(
                     .and_then(Value::as_i64);
                 match extract_telegram_callback_route(conn, callback_query, telegram)? {
                     Some(route) => {
-                        let result = send_codex_approval_to_thread(
-                            conn,
-                            config,
-                            &route.thread_id,
-                            route.action,
-                            now,
-                            deadline,
-                        )?;
-                        if let Some(update_id) = update_id {
-                            record_telegram_inbound_processed(
+                        let dispatched = if let Some(approval_key) = route.approval_key.as_deref() {
+                            match send_native_codex_approval(
                                 conn,
-                                &bot_id,
-                                update_id,
-                                "callback_query",
-                                &result,
-                                codex_log_context_from_result(
-                                    &result,
-                                    Some(&route.thread_id),
-                                    route_message_id,
-                                ),
+                                config,
+                                approval_key,
+                                route.action,
                                 now,
-                            )?;
+                                deadline,
+                            ) {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    let _ = telegram_answer_callback_query(
+                                        telegram,
+                                        &route.callback_query_id,
+                                        "Codex is temporarily unavailable; tap again to retry",
+                                        timeout,
+                                    );
+                                    return Err(error);
+                                }
+                            }
+                        } else {
+                            Some(send_legacy_codex_approval_to_thread(
+                                conn,
+                                config,
+                                &route.thread_id,
+                                route.action,
+                                now,
+                                deadline,
+                            )?)
+                        };
+                        match dispatched {
+                            Some(result) => {
+                                if let Some(update_id) = update_id {
+                                    record_telegram_inbound_processed(
+                                        conn,
+                                        bot_id,
+                                        update_id,
+                                        "callback_query",
+                                        &result,
+                                        codex_log_context_from_result(
+                                            &result,
+                                            Some(&route.thread_id),
+                                            route_message_id,
+                                        ),
+                                        now,
+                                    )?;
+                                }
+                                mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                                let _ = telegram_answer_callback_query(
+                                    telegram,
+                                    &route.callback_query_id,
+                                    "Sent to Codex",
+                                    timeout,
+                                );
+                                callbacks += 1;
+                            }
+                            None => {
+                                mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                                let result = json!({
+                                    "ok": true,
+                                    "action": "telegram_approval_expired",
+                                    "threadId": route.thread_id,
+                                    "ignored": true,
+                                });
+                                if let Some(update_id) = update_id {
+                                    record_telegram_inbound_processed(
+                                        conn,
+                                        bot_id,
+                                        update_id,
+                                        "callback_query_expired",
+                                        &result,
+                                        TelegramInboundLogContext {
+                                            thread_id: Some(&route.thread_id),
+                                            route_message_id,
+                                            result_action: Some("telegram_approval_expired"),
+                                            ..TelegramInboundLogContext::default()
+                                        },
+                                        now,
+                                    )?;
+                                }
+                                let _ = telegram_answer_callback_query(
+                                    telegram,
+                                    &route.callback_query_id,
+                                    "This approval is no longer pending",
+                                    timeout,
+                                );
+                                ignored += 1;
+                            }
                         }
-                        // Consume the callback route once the approval was accepted by
-                        // Codex, so retried taps or a failed answerCallbackQuery cannot
-                        // send the same YES/NO twice.
-                        mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
-                        let _ = telegram_answer_callback_query(
-                            telegram,
-                            &route.callback_query_id,
-                            "Sent to Codex",
-                            timeout,
-                        );
-                        callbacks += 1;
                     }
                     None => {
+                        if let Some(callback_query_id) =
+                            callback_query.get("id").and_then(Value::as_str)
+                        {
+                            let _ = telegram_answer_callback_query(
+                                telegram,
+                                callback_query_id,
+                                "This approval is no longer pending",
+                                timeout,
+                            );
+                        }
                         if let Some(update_id) = update_id {
                             record_telegram_inbound_processed(
                                 conn,
-                                &bot_id,
+                                bot_id,
                                 update_id,
                                 "callback_query_ignored",
                                 &json!({ "ignored": true }),
@@ -1663,7 +1822,7 @@ fn process_telegram_update_batch(
             if let Some(update_id) = update_id {
                 record_telegram_inbound_processed(
                     conn,
-                    &bot_id,
+                    bot_id,
                     update_id,
                     "update_error",
                     &json!({ "error": format!("{error:#}") }),
@@ -1835,6 +1994,69 @@ mod tests {
             }
         }
 
+        fn spawn_approval_replay(server_request: Value) -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake approval codex ws");
+            let address = listener.local_addr().expect("fake codex ws address");
+            let url = format!("ws://{address}");
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let join = thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept fake codex ws");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                let mut requests = Vec::new();
+                loop {
+                    let message = socket.read().expect("read websocket request");
+                    let text = message.into_text().expect("websocket text");
+                    let request: Value = serde_json::from_str(&text).expect("parse request");
+                    requests.push(request.clone());
+                    let method = request.get("method").and_then(Value::as_str);
+                    let id = request.get("id").cloned();
+                    match (method, id) {
+                        (Some("initialize"), Some(id)) => socket
+                            .send(tungstenite::Message::text(
+                                serde_json::to_string(&json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "protocolVersion": 1,
+                                        "serverInfo": { "name": "fake-codex", "version": "test" }
+                                    }
+                                }))
+                                .expect("serialize initialize response"),
+                            ))
+                            .expect("send initialize response"),
+                        (Some("initialized"), None) => {}
+                        (Some("thread/resume"), Some(id)) => {
+                            socket
+                                .send(tungstenite::Message::text(
+                                    serde_json::to_string(&json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": { "thread": { "id": "thr_1" } }
+                                    }))
+                                    .expect("serialize resume response"),
+                                ))
+                                .expect("send resume response");
+                            socket
+                                .send(tungstenite::Message::text(
+                                    serde_json::to_string(&server_request)
+                                        .expect("serialize approval request"),
+                                ))
+                                .expect("replay approval request");
+                        }
+                        (None, Some(_)) => break,
+                        (other, _) => panic!("unexpected fake Codex message {other:?}"),
+                    }
+                }
+                requests_tx.send(requests).expect("send requests");
+            });
+            Self {
+                url,
+                requests: requests_rx,
+                join,
+            }
+        }
+
         fn finish(self) -> Vec<Value> {
             let requests = self.requests.recv().expect("fake codex requests");
             self.join.join().expect("fake codex thread");
@@ -1888,6 +2110,7 @@ mod tests {
             events: crate::DEFAULT_NOTIFICATION_EVENTS,
             bridge_command: "codex-telegram-bridge",
             websocket_url: "ws://127.0.0.1:4500",
+            codex_home: None,
             dry_run: true,
             pair_timeout_ms: 1000,
         })
@@ -1900,6 +2123,14 @@ mod tests {
         assert_eq!(result["config"]["telegram"]["botToken"], "<redacted>");
         assert_eq!(result["config"]["telegram"]["chatId"], "456");
         assert_eq!(result["config"]["telegram"]["allowedUserId"], "789");
+        assert_eq!(
+            result["config"]["codex"]["codexHome"],
+            dirs::home_dir()
+                .expect("test user home")
+                .join(".codex")
+                .display()
+                .to_string()
+        );
         assert_eq!(result["daemonCommand"], "codex-telegram-bridge daemon run");
         assert!(
             !serde_json::to_string(&result)
@@ -2020,6 +2251,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
@@ -2069,11 +2301,12 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
 
-        let result = send_codex_approval_to_thread(
+        let result = send_legacy_codex_approval_to_thread(
             &conn,
             &config,
             "thr_1",
@@ -2111,6 +2344,68 @@ mod tests {
     }
 
     #[test]
+    fn telegram_native_approval_responds_to_the_replayed_json_rpc_request() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let server_request = json!({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "command": "git push",
+                "cwd": "/tmp/project",
+                "startedAtMs": 42
+            }
+        });
+        let approval = crate::codex::parse_app_server_approval_request(&server_request)
+            .expect("parse approval")
+            .expect("approval request");
+        crate::state::upsert_app_server_approval_request(&conn, &approval, 1000)
+            .expect("store approval");
+        let server = FakeCodexWsServer::spawn_approval_replay(server_request);
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: server.url.clone(),
+                codex_home: None,
+            }),
+            projects: Vec::new(),
+        };
+
+        let result = send_native_codex_approval(
+            &conn,
+            &config,
+            &approval.approval_key,
+            TelegramCallbackAction::ApproveForSession,
+            1100,
+            None,
+        )
+        .expect("dispatch approval")
+        .expect("approval still pending");
+        assert_eq!(result["action"], "telegram_app_server_approval");
+        assert_eq!(result["decision"], "approve_for_session");
+        assert!(
+            lookup_pending_app_server_approval(&conn, &approval.approval_key)
+                .expect("lookup after response")
+                .is_none()
+        );
+        let messages = server.finish();
+        let response = messages.last().expect("approval response");
+        assert_eq!(response["id"], 61);
+        assert_eq!(
+            response["result"],
+            json!({ "decision": "acceptForSession" })
+        );
+        assert!(response.get("method").is_none());
+    }
+
+    #[test]
     fn remote_commands_start_stop_and_repair_shared_backend() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let _env = LiveCommandEnv::new("start-reset");
@@ -2127,6 +2422,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: websocket_url.clone(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         })
@@ -2250,6 +2546,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
@@ -2378,6 +2675,7 @@ mod tests {
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
+                codex_home: None,
             }),
             projects: Vec::new(),
         };
@@ -2459,6 +2757,7 @@ mod tests {
                 message_id: None,
                 thread_id: "thr_1".to_string(),
                 action: TelegramCallbackAction::Approve,
+                approval_key: None,
             },
             1000,
         )
