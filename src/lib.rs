@@ -1613,6 +1613,31 @@ mod tests {
         }
     }
 
+    /// Points HOME at an empty directory so daemon service lookups find no installed
+    /// service and never reach the developer's real systemd/launchd daemon.
+    struct TempHome {
+        previous_home: Option<std::ffi::OsString>,
+    }
+
+    impl TempHome {
+        fn new(home: PathBuf) -> Self {
+            fs::create_dir_all(&home).expect("create temp home");
+            let previous_home = std::env::var_os("HOME");
+            std::env::set_var("HOME", &home);
+            Self { previous_home }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            if let Some(previous_home) = &self.previous_home {
+                std::env::set_var("HOME", previous_home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
     #[test]
     fn derives_waiting_prompt_from_status_flags() {
         let summary = json!({
@@ -1948,6 +1973,8 @@ mod tests {
     fn reset_removes_runtime_state_and_preserves_config() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let state = TempStateDir::new("reset-removes");
+        // A non-dry-run reset stops the installed daemon service when it is running.
+        let _home = TempHome::new(state.root.join("home"));
         write_daemon_config(&DaemonConfig {
             version: 4,
             bridge_command: "codex-telegram-bridge".to_string(),
