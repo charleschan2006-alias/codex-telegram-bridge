@@ -1601,12 +1601,17 @@ mod tests {
             .spawn()
             .expect("run spawn script");
         let process_group = launcher.id();
-        let output = launcher
-            .wait_with_output()
-            .expect("collect spawn script output");
+        // Read on a helper thread with a deadline: on a regression the read only ends when
+        // every pipe holder exits, which may be never (e.g. a `tail` that outlives its reader).
+        let (output_tx, output_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = output_tx.send(launcher.wait_with_output());
+        });
+        let output = output_rx.recv_timeout(Duration::from_secs(5));
         let elapsed = started.elapsed();
 
         // Tear down what the script left behind before asserting, so a failure leaks nothing.
+        // This also closes the pipe, which releases the helper thread on a timeout.
         let _ = Command::new("sh")
             .arg("-c")
             .arg(r#"kill -s TERM -- "-$1""#)
@@ -1615,17 +1620,21 @@ mod tests {
             .status();
         let _ = fs::remove_dir_all(&dir);
 
+        let output = output
+            .unwrap_or_else(|_| {
+                panic!(
+                    "launcher stdout must reach EOF while the app-server is still running \
+                     (still open after {elapsed:?}); the long-lived children inherited the \
+                     launcher's stdout pipe"
+                )
+            })
+            .expect("collect spawn script output");
         assert!(output.status.success(), "launcher shell failed: {output:?}");
         let child_pid = String::from_utf8_lossy(&output.stdout)
             .trim()
             .parse::<u32>()
             .expect("spawn script must print the app-server pid");
         assert!(child_pid > 0);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "launcher stdout must reach EOF while the app-server is still running (took {elapsed:?}); \
-             the long-lived children inherited the launcher's stdout pipe"
-        );
     }
 
     #[test]
