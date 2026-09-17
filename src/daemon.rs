@@ -802,6 +802,9 @@ pub(crate) fn uninstall_daemon_service(label: &str, dry_run: bool) -> Result<Val
 }
 
 fn run_shell_command(command: &str) -> Result<Value> {
+    #[cfg(test)]
+    assert_test_leaves_service_manager_alone(command);
+
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
@@ -813,6 +816,30 @@ fn run_shell_command(command: &str) -> Result<Value> {
         "stdout": String::from_utf8_lossy(&output.stdout).trim(),
         "stderr": String::from_utf8_lossy(&output.stderr).trim()
     }))
+}
+
+/// Tests run against the developer's real service manager, so a test that reaches one of
+/// these commands would stop, start, or re-register the developer's own running daemon.
+#[cfg(test)]
+fn assert_test_leaves_service_manager_alone(command: &str) {
+    const MUTATING_COMMANDS: &[&str] = &[
+        "systemctl --user start",
+        "systemctl --user stop",
+        "systemctl --user restart",
+        "systemctl --user enable",
+        "systemctl --user disable",
+        "systemctl --user daemon-reload",
+        "launchctl bootstrap",
+        "launchctl bootout",
+        "launchctl kickstart",
+    ];
+    assert!(
+        !MUTATING_COMMANDS
+            .iter()
+            .any(|mutating| command.contains(mutating)),
+        "tests must not change the real service manager, but tried to run `{command}`; \
+         point HOME at a temp dir so no installed service is found"
+    );
 }
 
 fn command_status_summary(output: &Value) -> Value {
