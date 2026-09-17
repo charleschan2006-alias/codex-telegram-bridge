@@ -752,8 +752,10 @@ binary=$1
 url=$2
 # codex app-server exits when stdin is EOF and when its launcher disappears.
 # Keep stdin open and leave a tiny supervisor waiting while returning the app-server pid.
+# fd 3 is the launcher's stdout pipe: the caller reads it until EOF, so the
+# long-lived children must not inherit it (3>&-) or the caller blocks forever.
 (
-  tail -f /dev/null | "$binary" app-server --listen "$url" >/dev/null 2>&1 &
+  tail -f /dev/null 3>&- | "$binary" app-server --listen "$url" >/dev/null 2>&1 3>&- &
   child=$!
   printf '%s\n' "$child" >&3
   exec 3>&-
@@ -1549,7 +1551,7 @@ mod tests {
         let script = live_backend_spawn_shell_script();
 
         assert!(
-            script.contains(r#"tail -f /dev/null | "$binary" app-server --listen "$url""#),
+            script.contains(r#"tail -f /dev/null 3>&- | "$binary" app-server --listen "$url""#),
             "app-server stdin must stay open after the launcher shell exits"
         );
         assert!(
@@ -1560,6 +1562,79 @@ mod tests {
             !script.contains("</dev/null"),
             "redirecting app-server stdin from /dev/null makes it exit immediately"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_backend_fallback_spawn_script_releases_the_launcher_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        // A stand-in app-server that ignores its arguments and keeps running for a while,
+        // like the real one does. The launcher is read to EOF (as `Command::output()` does
+        // in production), which only completes once every holder of its stdout pipe has
+        // closed it.
+        let dir = std::env::temp_dir().join(format!(
+            "codex-bridge-spawn-script-{}-{}",
+            std::process::id(),
+            next_test_backend_pid()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fake = dir.join("fake-app-server.sh");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 20\n").expect("write fake app-server");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // The launcher gets its own process group so everything it leaves behind (the
+        // supervisor subshell, the stand-in app-server and its `tail` sibling) can be torn
+        // down as a group, without platform-specific process-tree inspection.
+        let started = Instant::now();
+        let launcher = Command::new("sh")
+            .arg("-c")
+            .arg(live_backend_spawn_shell_script())
+            .arg("codex-live-backend")
+            .arg(&fake)
+            .arg("ws://127.0.0.1:1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("run spawn script");
+        let process_group = launcher.id();
+        // Read on a helper thread with a deadline: on a regression the read only ends when
+        // every pipe holder exits, which may be never (e.g. a `tail` that outlives its reader).
+        let (output_tx, output_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = output_tx.send(launcher.wait_with_output());
+        });
+        let output = output_rx.recv_timeout(Duration::from_secs(5));
+        let elapsed = started.elapsed();
+
+        // Tear down what the script left behind before asserting, so a failure leaks nothing.
+        // This also closes the pipe, which releases the helper thread on a timeout.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(r#"kill -s TERM -- "-$1""#)
+            .arg("kill-spawn-script-group")
+            .arg(process_group.to_string())
+            .status();
+        let _ = fs::remove_dir_all(&dir);
+
+        let output = output
+            .unwrap_or_else(|_| {
+                panic!(
+                    "launcher stdout must reach EOF while the app-server is still running \
+                     (still open after {elapsed:?}); the long-lived children inherited the \
+                     launcher's stdout pipe"
+                )
+            })
+            .expect("collect spawn script output");
+        assert!(output.status.success(), "launcher shell failed: {output:?}");
+        let child_pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .expect("spawn script must print the app-server pid");
+        assert!(child_pid > 0);
     }
 
     #[test]
