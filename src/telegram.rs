@@ -52,6 +52,7 @@ use self::render::{
     TELEGRAM_MESSAGE_CHAR_LIMIT,
 };
 
+use self::api::telegram_stable_bot_id;
 pub(crate) use self::api::{telegram_bot_id, telegram_set_my_commands};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1877,7 +1878,7 @@ fn retry_pending_message_deletions(
     now: u64,
     timeout: Duration,
 ) -> Result<()> {
-    let bot_id = telegram_bot_id(&telegram.bot_token);
+    let bot_id = telegram_stable_bot_id(&telegram.bot_token);
     for deletion in due_telegram_message_deletions(conn, now)? {
         // Deleting in the stored chat still works after the bridge is re-paired with another
         // chat; only a different bot can no longer remove the message.
@@ -1961,7 +1962,7 @@ fn process_telegram_update_batch(
                         if let Some(message_id) = route.message_id {
                             queue_telegram_message_deletion(
                                 conn,
-                                bot_id,
+                                &telegram_stable_bot_id(&telegram.bot_token),
                                 &telegram.chat_id,
                                 message_id,
                                 now,

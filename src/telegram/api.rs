@@ -269,9 +269,41 @@ pub(crate) fn telegram_bot_id(bot_token: &str) -> String {
     crate::sha256_hex(bot_token.as_bytes())[..16].to_string()
 }
 
+/// The bot's own numeric id, the part of the token before the colon. Unlike
+/// `telegram_bot_id`, it survives a token rotation for the same bot.
+pub(crate) fn telegram_stable_bot_id(bot_token: &str) -> String {
+    bot_token
+        .trim()
+        .split_once(':')
+        .map(|(id, _)| id)
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or_else(|| telegram_bot_id(bot_token), str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_bot_id_survives_token_rotation() {
+        assert_eq!(
+            telegram_stable_bot_id("8854269525:AAHfirst-secret"),
+            "8854269525"
+        );
+        assert_eq!(
+            telegram_stable_bot_id(" 8854269525:AAHrotated-secret "),
+            telegram_stable_bot_id("8854269525:AAHfirst-secret")
+        );
+        assert_ne!(
+            telegram_stable_bot_id("111:secret"),
+            telegram_stable_bot_id("222:secret")
+        );
+        assert_eq!(
+            telegram_stable_bot_id("not-a-token"),
+            telegram_bot_id("not-a-token"),
+            "an unexpected token shape falls back to the hashed id"
+        );
+    }
 
     #[test]
     fn telegram_bot_commands_are_registered_for_core_remote_actions() {

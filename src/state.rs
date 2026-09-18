@@ -476,6 +476,17 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM actions_log WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
+    // A question message's reply route goes with its buttons: a reply to it must never fall
+    // through to the ordinary thread route and start a turn once the question route is gone.
+    conn.execute(
+        "DELETE FROM telegram_message_routes
+         WHERE (chat_id, message_id) IN (
+             SELECT chat_id, message_id FROM telegram_callback_routes
+             WHERE created_at < ?1 AND used_at IS NOT NULL
+               AND question_id IS NOT NULL AND message_id IS NOT NULL
+         )",
+        params![sql_cutoff],
+    )?;
     let callbacks = conn.execute(
         "DELETE FROM telegram_callback_routes
          WHERE created_at < ?1 AND used_at IS NOT NULL",
@@ -3085,6 +3096,61 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
 
         assert!(path.ends_with(".codex-telegram-bridge/live-backend.json"));
+    }
+
+    #[test]
+    fn pruning_a_question_route_also_drops_its_message_reply_route() {
+        let conn = create_state_db_in_memory().expect("db");
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = 40 * day_ms;
+        let route =
+            |callback_id: &str, message_id: i64, question_id: Option<&str>| TelegramCallbackRoute {
+                callback_id: callback_id.to_string(),
+                chat_id: "456".to_string(),
+                message_id: Some(message_id),
+                thread_id: "thr_1".to_string(),
+                action: if question_id.is_some() {
+                    TelegramCallbackAction::SkipQuestion
+                } else {
+                    TelegramCallbackAction::Deny
+                },
+                approval_key: Some("key".to_string()),
+                question_id: question_id.map(str::to_string),
+                answer: None,
+            };
+        for (message_id, created_at) in [(10, 0), (11, 0), (12, now)] {
+            insert_telegram_message_route(&conn, "456", message_id, "thr_1", "event", created_at)
+                .expect("message route");
+        }
+        insert_telegram_callback_route(&conn, &route("cb_old_q", 10, Some("q")), 0)
+            .expect("old question route");
+        insert_telegram_callback_route(&conn, &route("cb_old_a", 11, None), 0)
+            .expect("old approval route");
+        insert_telegram_callback_route(&conn, &route("cb_new_q", 12, Some("q")), now)
+            .expect("recent question route");
+        for callback_id in ["cb_old_q", "cb_old_a", "cb_new_q"] {
+            mark_telegram_callback_route_used(&conn, callback_id, 1).expect("use");
+        }
+
+        prune_state_logs(&conn, now).expect("prune");
+
+        assert_eq!(
+            lookup_telegram_message_route(&conn, "456", 10).expect("q"),
+            None,
+            "a late reply to a pruned question must not reach the thread as a new turn"
+        );
+        assert_eq!(
+            lookup_telegram_message_route(&conn, "456", 11).expect("approval"),
+            Some("thr_1".to_string())
+        );
+        assert_eq!(
+            lookup_question_message_route(&conn, "456", 12).expect("recent"),
+            Some(("key".to_string(), "q".to_string()))
+        );
+        assert_eq!(
+            lookup_telegram_message_route(&conn, "456", 12).expect("recent message"),
+            Some("thr_1".to_string())
+        );
     }
 
     #[test]
