@@ -1929,6 +1929,11 @@ fn retry_pending_message_deletions(
                     finish_telegram_message_deletion(conn, &deletion)?;
                     continue;
                 }
+                // The deletion call may have used up the cycle; the warning then waits for the
+                // next cycle, when the entry is still due.
+                let Some(timeout) = budgeted_timeout(timeout, deadline) else {
+                    break;
+                };
                 // Keep the record until the warning is delivered: the outage that failed the
                 // deletion can fail the warning too, and then the user would learn nothing.
                 let warned = telegram_send_text_to_chat(
