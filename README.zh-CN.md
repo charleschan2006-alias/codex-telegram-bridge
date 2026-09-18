@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-本项目是 [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge) 的一个分支。
+本项目是 [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge) 的一个分支。原仓库和中间的 [zhang0098/codex-telegram-bridge](https://github.com/zhang0098/codex-telegram-bridge) 分支都已归档，本仓库是目前持续维护的版本。
 
 `codex-telegram-bridge` 让本地助手可以检查和控制 Codex 线程，并且当你明确标记自己离开时，通过 Telegram 继续远程工作。
 
@@ -55,10 +55,10 @@ cargo install --path .
 从 Git 安装：
 
 ```bash
-cargo install --git https://github.com/zhang0098/codex-telegram-bridge
+cargo install --git https://github.com/charleschan2006-alias/codex-telegram-bridge
 ```
 
-当有标签发布时，可以从 [GitHub Releases](https://github.com/zhang0098/codex-telegram-bridge/releases) 下载预构建压缩包。
+当有标签发布时，可以从 [GitHub Releases](https://github.com/charleschan2006-alias/codex-telegram-bridge/releases) 下载预构建压缩包。
 
 不安装直接通过包装脚本运行：
 

@@ -5,7 +5,7 @@ This repo tracks executable software work in GitHub Issues.
 | Field | Value |
 | --- | --- |
 | Tracker | GitHub Issues |
-| Remote | `git@github.com:HanifCarroll/codex-telegram-bridge.git` |
+| Remote | `git@github.com:charleschan2006-alias/codex-telegram-bridge.git` |
 | CLI | `gh` |
 
 When a Matt Pocock skill says to publish to the issue tracker, use GitHub Issues for this repo.

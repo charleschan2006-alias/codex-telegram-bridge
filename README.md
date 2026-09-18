@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-This project is a fork of [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge).
+This project is a fork of [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge). The original repository and the intermediate [zhang0098/codex-telegram-bridge](https://github.com/zhang0098/codex-telegram-bridge) fork are both archived; this repository is the maintained version.
 
 `codex-telegram-bridge` lets a local assistant inspect and control Codex threads, and lets you keep working through Telegram when you explicitly mark yourself away.
 
@@ -55,10 +55,10 @@ cargo install --path .
 Install from Git:
 
 ```bash
-cargo install --git https://github.com/zhang0098/codex-telegram-bridge
+cargo install --git https://github.com/charleschan2006-alias/codex-telegram-bridge
 ```
 
-Download a prebuilt archive from [GitHub Releases](https://github.com/zhang0098/codex-telegram-bridge/releases) when a tagged release is available.
+Download a prebuilt archive from [GitHub Releases](https://github.com/charleschan2006-alias/codex-telegram-bridge/releases) when a tagged release is available.
 
 Run through the wrapper without installing:
 

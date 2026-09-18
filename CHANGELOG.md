@@ -2,12 +2,17 @@
 
 All notable changes to `codex-telegram-bridge` will be documented here.
 
-## Unreleased
+## 0.2.0 - 2026-09-18
+
+This fork is now the maintained version: both [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge) and [zhang0098/codex-telegram-bridge](https://github.com/zhang0098/codex-telegram-bridge) are archived. Repository and install URLs point at [charleschan2006-alias/codex-telegram-bridge](https://github.com/charleschan2006-alias/codex-telegram-bridge).
 
 - Add `setup --codex-home` and `telegram setup --codex-home`; setup stores `~/.codex` when omitted, and the daemon passes the saved `CODEX_HOME` to its managed Codex App Server.
 - Keep a persistent App Server subscription to active threads and bridge native command, file-change, and permissions approval requests to Telegram with exact request-bound `Allow once`, `Allow session`, and `Deny` buttons.
 - Bridge Codex questions (`item/tool/requestUserInput`, asked in Plan mode) to Telegram: one message per question with option buttons and `Skip`, Telegram Reply for free-form answers when Codex allows them, and all answers sent back in a single App Server response once every question is answered or skipped. Answered questions show the choice and lose their buttons; secret answers are deleted from the chat and kept out of local logs.
-- Keep `cargo test` from stopping a locally installed daemon.
+- Mark question option buttons with colour dots and letters (🔴A, 🟠B, …) that match the option list in the message. Keep every question to a single message and every button within Telegram's text limit.
+- Fix `/away` hanging the daemon forever when it had to start the shared backend without `screen`: the launcher's long-lived children no longer inherit the pipe the daemon reads to EOF.
+- Report Telegram API failures with Telegram's own error description instead of a bare `http status: 400`.
+- Keep `cargo test` from stopping a locally installed daemon or touching the real `~/.codex-telegram-bridge`: environment-changing tests share one lock, and test builds never resolve the real state directory.
 - Redact service-manager stdout and stderr from `daemon status` so inherited environment variables and credentials are never returned in its JSON output.
 
 ## 0.1.1 - 2026-08-08
