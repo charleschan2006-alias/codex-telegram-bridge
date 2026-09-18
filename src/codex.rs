@@ -153,7 +153,7 @@ fn status_flags_waiting_for_approval(status_flags: &[String]) -> bool {
     status_flags.iter().any(|flag| flag == "waitingOnApproval")
 }
 
-fn status_flags_waiting_for_input(status_flags: &[String]) -> bool {
+pub(crate) fn status_flags_waiting_for_input(status_flags: &[String]) -> bool {
     status_flags
         .iter()
         .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")

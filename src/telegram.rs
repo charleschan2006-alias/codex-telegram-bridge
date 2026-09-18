@@ -16,14 +16,15 @@ use crate::codex::{
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
-    delete_setting, expire_app_server_approval, get_setting_number,
-    get_telegram_current_project_id, insert_telegram_callback_route, insert_telegram_command_route,
-    insert_telegram_message_route, list_recent_thread_snapshots_from_db,
-    lookup_pending_app_server_approval, lookup_question_message_route,
-    lookup_telegram_command_route, lookup_telegram_message_route,
+    delete_setting, due_telegram_message_deletions, expire_app_server_approval,
+    finish_telegram_message_deletion, get_setting_number, get_telegram_current_project_id,
+    insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
+    list_recent_thread_snapshots_from_db, lookup_pending_app_server_approval,
+    lookup_question_message_route, lookup_telegram_command_route, lookup_telegram_message_route,
     mark_app_server_approval_responded, mark_telegram_callback_route_used,
     mark_telegram_command_route_used, observed_workspaces_from_db, pending_question_answers,
-    record_action, record_pending_question_answer, record_telegram_inbound_processed, set_setting,
+    queue_telegram_message_deletion, record_action, record_failed_telegram_message_deletion,
+    record_pending_question_answer, record_telegram_inbound_processed, set_setting,
     set_setting_text, set_telegram_current_project_id, telegram_inbound_processed,
     update_telegram_callback_message_id, AppServerApprovalRequest, BridgeThreadSnapshot,
     TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
@@ -1804,6 +1805,7 @@ pub(crate) fn process_telegram_updates(
         .telegram
         .as_ref()
         .context("Telegram is not configured. Run setup first.")?;
+    retry_pending_message_deletions(conn, telegram, now, timeout)?;
     let bot_id = telegram_bot_id(&telegram.bot_token);
     let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
@@ -1812,6 +1814,68 @@ pub(crate) fn process_telegram_updates(
     process_telegram_update_batch(
         conn, config, telegram, &bot_id, &key, updates, now, timeout, deadline,
     )
+}
+
+/// Telegram lets a bot delete a message for 48 hours; stop retrying a little before that.
+const TELEGRAM_DELETE_WINDOW_MS: u64 = 47 * 60 * 60 * 1000;
+const TELEGRAM_SECRET_NOT_DELETED_TEXT: &str =
+    "⚠️ The bridge could not delete your secret answer to Codex from this chat. Please delete it yourself.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageDeletionStep {
+    Done,
+    Retry,
+    /// The message can no longer be deleted: stop and ask the user to delete it.
+    GiveUp,
+}
+
+/// `error` is the failed `deleteMessage` call, or None when it succeeded.
+fn message_deletion_step(error: Option<&str>, created_at: u64, now: u64) -> MessageDeletionStep {
+    match error {
+        None => MessageDeletionStep::Done,
+        Some(error) if error.contains("message to delete not found") => MessageDeletionStep::Done,
+        Some(error)
+            if error.contains("message can't be deleted")
+                || now.saturating_sub(created_at) >= TELEGRAM_DELETE_WINDOW_MS =>
+        {
+            MessageDeletionStep::GiveUp
+        }
+        Some(_) => MessageDeletionStep::Retry,
+    }
+}
+
+/// Retries queued deletions, such as secret answers. A failed Telegram call is retried on
+/// later cycles with backoff; once the deletion window closes, the user is told to delete the
+/// message themselves, so the promise to delete is never silently dropped.
+fn retry_pending_message_deletions(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<()> {
+    for deletion in due_telegram_message_deletions(conn, now)? {
+        if deletion.chat_id != telegram.chat_id {
+            // The bot was reconfigured for another chat and can no longer reach this one.
+            finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
+            continue;
+        }
+        let error = telegram_delete_message(telegram, deletion.message_id, timeout)
+            .err()
+            .map(|error| format!("{error:#}"));
+        match message_deletion_step(error.as_deref(), deletion.created_at, now) {
+            MessageDeletionStep::Done => {
+                finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
+            }
+            MessageDeletionStep::GiveUp => {
+                finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
+                let _ = telegram_send_text(telegram, TELEGRAM_SECRET_NOT_DELETED_TEXT, timeout);
+            }
+            MessageDeletionStep::Retry => {
+                record_failed_telegram_message_deletion(conn, &deletion, now)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn advance_telegram_ack_offset(max_acked: &mut Option<i64>, update_id: Option<i64>) {
@@ -1884,7 +1948,13 @@ fn process_telegram_update_batch(
                         } => {
                             if is_secret {
                                 if let Some(message_id) = route.message_id {
-                                    let _ = telegram_delete_message(telegram, message_id, timeout);
+                                    queue_telegram_message_deletion(
+                                        conn,
+                                        &telegram.chat_id,
+                                        message_id,
+                                        now,
+                                    )?;
+                                    retry_pending_message_deletions(conn, telegram, now, timeout)?;
                                 }
                             }
                             settle_question_message(
@@ -3137,6 +3207,44 @@ mod tests {
         assert!(extract_telegram_question_reply(&conn, &stranger, &telegram)
             .expect("extract unauthorized")
             .is_none());
+    }
+
+    #[test]
+    fn secret_reply_deletion_retries_until_telegram_refuses_or_the_window_closes() {
+        let created = 1_000_000;
+        assert_eq!(
+            message_deletion_step(None, created, created),
+            MessageDeletionStep::Done
+        );
+        assert_eq!(
+            message_deletion_step(
+                Some("Bad Request: message to delete not found"),
+                created,
+                created
+            ),
+            MessageDeletionStep::Done,
+            "already gone counts as deleted"
+        );
+        assert_eq!(
+            message_deletion_step(Some("request failed: timed out"), created, created + 60_000),
+            MessageDeletionStep::Retry
+        );
+        assert_eq!(
+            message_deletion_step(
+                Some("request failed: timed out"),
+                created,
+                created + TELEGRAM_DELETE_WINDOW_MS
+            ),
+            MessageDeletionStep::GiveUp
+        );
+        assert_eq!(
+            message_deletion_step(
+                Some("Bad Request: message can't be deleted"),
+                created,
+                created
+            ),
+            MessageDeletionStep::GiveUp
+        );
     }
 
     #[test]

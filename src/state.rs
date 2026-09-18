@@ -579,6 +579,14 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           responded_at INTEGER,
           resolved_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS telegram_pending_deletions (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, message_id)
+        );
         CREATE TABLE IF NOT EXISTS telegram_command_routes (
           chat_id TEXT NOT NULL,
           message_id INTEGER NOT NULL,
@@ -1880,6 +1888,113 @@ pub(crate) fn lookup_question_message_route(
     .map_err(Into::into)
 }
 
+/// Expires pending `method` requests of a thread that Codex no longer shows as waiting.
+/// `serverRequest/resolved` is missed while the daemon is down, and resolved requests are not
+/// replayed, so without this a stale row would stay pending forever. Requests first seen in
+/// this cycle are kept: the thread snapshot may predate them.
+pub(crate) fn expire_stale_server_requests(
+    conn: &Connection,
+    thread_id: &str,
+    method: &str,
+    now: u64,
+) -> Result<usize> {
+    let now = to_sql_i64(now)?;
+    conn.execute(
+        "UPDATE telegram_callback_routes SET used_at = ?3
+         WHERE approval_key IN (
+             SELECT approval_key FROM app_server_approval_requests
+             WHERE thread_id = ?1 AND method = ?2 AND status = 'pending' AND created_at < ?3
+         ) AND used_at IS NULL",
+        params![thread_id, method, now],
+    )?;
+    let expired = conn.execute(
+        "UPDATE app_server_approval_requests
+         SET status = 'expired', resolved_at = ?3, answers_json = NULL
+         WHERE thread_id = ?1 AND method = ?2 AND status = 'pending' AND created_at < ?3",
+        params![thread_id, method, now],
+    )?;
+    Ok(expired)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingTelegramDeletion {
+    pub(crate) chat_id: String,
+    pub(crate) message_id: i64,
+    pub(crate) created_at: u64,
+    pub(crate) attempts: u32,
+}
+
+/// Queues a message for deletion, so a failed Telegram call is retried on later cycles
+/// instead of leaving, for example, a secret answer in the chat.
+pub(crate) fn queue_telegram_message_deletion(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO telegram_pending_deletions(
+            chat_id, message_id, created_at, attempts, next_attempt_at
+         ) VALUES (?1, ?2, ?3, 0, ?3)",
+        params![chat_id, message_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn due_telegram_message_deletions(
+    conn: &Connection,
+    now: u64,
+) -> Result<Vec<PendingTelegramDeletion>> {
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, message_id, created_at, attempts FROM telegram_pending_deletions
+         WHERE next_attempt_at <= ?1
+         ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map(params![to_sql_i64(now)?], |row| {
+            Ok(PendingTelegramDeletion {
+                chat_id: row.get(0)?,
+                message_id: row.get(1)?,
+                created_at: row.get::<_, i64>(2)?.max(0) as u64,
+                attempts: row.get::<_, i64>(3)?.clamp(0, i64::from(u32::MAX)) as u32,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(crate) fn finish_telegram_message_deletion(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM telegram_pending_deletions WHERE chat_id = ?1 AND message_id = ?2",
+        params![chat_id, message_id],
+    )?;
+    Ok(())
+}
+
+/// Backs off exponentially from 2s up to 10 minutes between attempts.
+pub(crate) fn record_failed_telegram_message_deletion(
+    conn: &Connection,
+    deletion: &PendingTelegramDeletion,
+    now: u64,
+) -> Result<()> {
+    let backoff_ms = (2_000u64 << deletion.attempts.min(9)).min(600_000);
+    conn.execute(
+        "UPDATE telegram_pending_deletions
+         SET attempts = attempts + 1, next_attempt_at = ?3
+         WHERE chat_id = ?1 AND message_id = ?2",
+        params![
+            deletion.chat_id,
+            deletion.message_id,
+            to_sql_i64(now.saturating_add(backoff_ms))?
+        ],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn thread_has_pending_server_request(
     conn: &Connection,
     thread_id: &str,
@@ -2517,6 +2632,110 @@ mod tests {
             !thread_has_pending_server_request(&conn, "thr_q", "item/tool/requestUserInput")
                 .expect("no pending question")
         );
+    }
+
+    #[test]
+    fn stale_server_request_expiry_keeps_this_cycles_requests_and_other_methods() {
+        let conn = create_state_db_in_memory().expect("db");
+        let store = |key: &str, method: &str, observed_at: u64| {
+            upsert_app_server_approval_request(
+                &conn,
+                &AppServerApprovalRequest {
+                    approval_key: key.to_string(),
+                    request_id: json!(key),
+                    method: method.to_string(),
+                    thread_id: "thr_1".to_string(),
+                    turn_id: "turn_1".to_string(),
+                    item_id: key.to_string(),
+                    params: json!({}),
+                },
+                observed_at,
+            )
+            .expect("store");
+        };
+        let question = "item/tool/requestUserInput";
+        store("question_old", question, 1000);
+        store("question_new", question, 2000);
+        store(
+            "approval_old",
+            "item/commandExecution/requestApproval",
+            1000,
+        );
+        insert_telegram_callback_route(
+            &conn,
+            &TelegramCallbackRoute {
+                callback_id: "cb_old".to_string(),
+                chat_id: "456".to_string(),
+                message_id: Some(1),
+                thread_id: "thr_1".to_string(),
+                action: TelegramCallbackAction::SkipQuestion,
+                approval_key: Some("question_old".to_string()),
+                question_id: Some("q".to_string()),
+                answer: None,
+            },
+            1000,
+        )
+        .expect("route");
+
+        assert_eq!(
+            expire_stale_server_requests(&conn, "thr_1", question, 2000).expect("expire"),
+            1
+        );
+        assert!(lookup_pending_app_server_approval(&conn, "question_old")
+            .expect("old")
+            .is_none());
+        assert!(lookup_pending_app_server_approval(&conn, "question_new")
+            .expect("new")
+            .is_some());
+        assert!(lookup_pending_app_server_approval(&conn, "approval_old")
+            .expect("approval")
+            .is_some());
+        let used: Option<i64> = conn
+            .query_row(
+                "SELECT used_at FROM telegram_callback_routes WHERE callback_id = 'cb_old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("route row");
+        assert_eq!(used, Some(2000), "the stale question's buttons are retired");
+    }
+
+    #[test]
+    fn queued_message_deletions_back_off_until_finished() {
+        let conn = create_state_db_in_memory().expect("db");
+        queue_telegram_message_deletion(&conn, "456", 77, 1000).expect("queue");
+        queue_telegram_message_deletion(&conn, "456", 77, 1500).expect("queue twice");
+
+        let due = due_telegram_message_deletions(&conn, 1000).expect("due");
+        assert_eq!(
+            due.len(),
+            1,
+            "queueing the same message twice keeps one entry"
+        );
+        assert_eq!(due[0].created_at, 1000);
+        assert_eq!(due[0].attempts, 0);
+
+        record_failed_telegram_message_deletion(&conn, &due[0], 1000).expect("fail once");
+        assert!(due_telegram_message_deletions(&conn, 2999)
+            .expect("before backoff")
+            .is_empty());
+        let retry = due_telegram_message_deletions(&conn, 3000).expect("after backoff");
+        assert_eq!(retry[0].attempts, 1);
+        record_failed_telegram_message_deletion(&conn, &retry[0], 3000).expect("fail twice");
+        assert!(due_telegram_message_deletions(&conn, 6999)
+            .expect("longer backoff")
+            .is_empty());
+        assert_eq!(
+            due_telegram_message_deletions(&conn, 7000)
+                .expect("due again")
+                .len(),
+            1
+        );
+
+        finish_telegram_message_deletion(&conn, "456", 77).expect("finish");
+        assert!(due_telegram_message_deletions(&conn, u64::from(u32::MAX))
+            .expect("after finish")
+            .is_empty());
     }
 
     #[test]

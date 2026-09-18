@@ -13,16 +13,16 @@ use std::time::{Duration, Instant};
 use crate::codex::{
     app_server_approval_event, app_server_question_events, codex_backend_from_config,
     filter_watch_events, is_app_server_question_request, parse_app_server_approval_request,
-    parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
-    watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient,
-    APP_SERVER_USER_INPUT_METHOD,
+    parse_event_filter, start_codex_watch_receiver, status_flags_waiting_for_input,
+    sync_state_from_live, watch_events_from_sync_result, watch_thread_error_event,
+    CodexAppServerClient, APP_SERVER_USER_INPUT_METHOD,
 };
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event,
-    lookup_pending_app_server_approval, pending_outbound_count, prune_state_logs,
-    record_transport_delivery, resolve_app_server_approval_request, should_emit_for_away_window,
-    state_db_path, thread_has_pending_server_request, transport_delivery_exists,
-    upsert_app_server_approval_request, OutboxDeliverySummary,
+    expire_stale_server_requests, lookup_pending_app_server_approval, pending_outbound_count,
+    prune_state_logs, record_transport_delivery, resolve_app_server_approval_request,
+    should_emit_for_away_window, state_db_path, thread_has_pending_server_request,
+    transport_delivery_exists, upsert_app_server_approval_request, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
@@ -256,6 +256,32 @@ fn enrich_approval_event_with_thread(mut event: Value, sync_result: &Value) -> V
     event
 }
 
+/// Expires persisted questions of threads that this cycle's snapshot shows are no longer
+/// waiting for input, e.g. answered by another client while the daemon was down. Otherwise a
+/// stale question would suppress that thread's generic "reply" alerts forever.
+fn reconcile_stale_questions(conn: &Connection, sync_result: &Value, now: u64) -> Result<()> {
+    let Some(threads) = sync_result.get("threads").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for thread in threads {
+        let Some(thread_id) = thread.get("threadId").and_then(Value::as_str) else {
+            continue;
+        };
+        let status_flags = thread
+            .get("statusFlags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !status_flags_waiting_for_input(&status_flags) {
+            expire_stale_server_requests(conn, thread_id, APP_SERVER_USER_INPUT_METHOD, now)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_daemon_app_server_events(
     client: &mut CodexAppServerClient,
     conn: &Connection,
@@ -290,6 +316,8 @@ fn collect_daemon_app_server_events(
         };
         resolve_app_server_approval_request(conn, thread_id, request_id, now)?;
     }
+
+    reconcile_stale_questions(conn, sync_result, now)?;
 
     let active_native_threads = observed_approvals
         .iter()
@@ -1070,6 +1098,56 @@ mod tests {
     use super::*;
     use crate::codex::set_away_mode;
     use crate::state::{create_state_db_in_memory, pending_outbound_count};
+
+    #[test]
+    fn stale_questions_are_expired_once_their_thread_stops_waiting() {
+        let conn = create_state_db_in_memory().expect("db");
+        let store = |thread_id: &str, item_id: &str, observed_at: u64| {
+            let request = parse_app_server_approval_request(&json!({
+                "id": 1,
+                "method": APP_SERVER_USER_INPUT_METHOD,
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": "turn_1",
+                    "itemId": item_id,
+                    "questions": [{ "id": "q", "question": "?", "options": null }]
+                }
+            }))
+            .expect("parse")
+            .expect("question request");
+            upsert_app_server_approval_request(&conn, &request, observed_at).expect("store");
+        };
+        // Answered elsewhere while the daemon was down: the thread no longer waits.
+        store("thr_stale", "call_old", 1000);
+        // Still waiting on this question.
+        store("thr_live", "call_live", 1000);
+        // First seen this cycle; the snapshot may predate it.
+        store("thr_fresh", "call_new", 2000);
+        let sync_result = json!({
+            "threads": [
+                { "threadId": "thr_stale", "statusType": "idle", "statusFlags": [] },
+                {
+                    "threadId": "thr_live",
+                    "statusType": "active",
+                    "statusFlags": ["waitingOnUserInput"]
+                },
+                { "threadId": "thr_fresh", "statusType": "active", "statusFlags": [] }
+            ]
+        });
+
+        reconcile_stale_questions(&conn, &sync_result, 2000).expect("reconcile");
+
+        let pending = |thread_id| {
+            thread_has_pending_server_request(&conn, thread_id, APP_SERVER_USER_INPUT_METHOD)
+                .expect("lookup")
+        };
+        assert!(
+            !pending("thr_stale"),
+            "a stale question must stop suppressing alerts"
+        );
+        assert!(pending("thr_live"));
+        assert!(pending("thr_fresh"));
+    }
     use std::path::PathBuf;
 
     struct TempStateDir {
