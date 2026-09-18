@@ -1985,22 +1985,27 @@ pub(crate) fn queue_telegram_message_deletion(
 pub(crate) fn due_telegram_message_deletions(
     conn: &Connection,
     now: u64,
+    limit: usize,
 ) -> Result<Vec<PendingTelegramDeletion>> {
     let mut stmt = conn.prepare(
         "SELECT bot_id, chat_id, message_id, created_at, attempts FROM telegram_pending_deletions
          WHERE next_attempt_at <= ?1
-         ORDER BY created_at",
+         ORDER BY next_attempt_at, created_at
+         LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![to_sql_i64(now)?], |row| {
-            Ok(PendingTelegramDeletion {
-                bot_id: row.get(0)?,
-                chat_id: row.get(1)?,
-                message_id: row.get(2)?,
-                created_at: row.get::<_, i64>(3)?.max(0) as u64,
-                attempts: row.get::<_, i64>(4)?.clamp(0, i64::from(u32::MAX)) as u32,
-            })
-        })?
+        .query_map(
+            params![to_sql_i64(now)?, to_sql_i64(limit as u64)?],
+            |row| {
+                Ok(PendingTelegramDeletion {
+                    bot_id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    created_at: row.get::<_, i64>(3)?.max(0) as u64,
+                    attempts: row.get::<_, i64>(4)?.clamp(0, i64::from(u32::MAX)) as u32,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2777,7 +2782,7 @@ mod tests {
         queue_telegram_message_deletion(&conn, "bot_a", "456", 77, 1000).expect("queue");
         queue_telegram_message_deletion(&conn, "bot_a", "456", 77, 1500).expect("queue twice");
 
-        let due = due_telegram_message_deletions(&conn, 1000).expect("due");
+        let due = due_telegram_message_deletions(&conn, 1000, 10).expect("due");
         assert_eq!(
             due.len(),
             1,
@@ -2792,26 +2797,40 @@ mod tests {
         );
 
         record_failed_telegram_message_deletion(&conn, &due[0], 1000).expect("fail once");
-        assert!(due_telegram_message_deletions(&conn, 2999)
+        assert!(due_telegram_message_deletions(&conn, 2999, 10)
             .expect("before backoff")
             .is_empty());
-        let retry = due_telegram_message_deletions(&conn, 3000).expect("after backoff");
+        let retry = due_telegram_message_deletions(&conn, 3000, 10).expect("after backoff");
         assert_eq!(retry[0].attempts, 1);
         record_failed_telegram_message_deletion(&conn, &retry[0], 3000).expect("fail twice");
-        assert!(due_telegram_message_deletions(&conn, 6999)
+        assert!(due_telegram_message_deletions(&conn, 6999, 10)
             .expect("longer backoff")
             .is_empty());
         assert_eq!(
-            due_telegram_message_deletions(&conn, 7000)
+            due_telegram_message_deletions(&conn, 7000, 10)
                 .expect("due again")
                 .len(),
             1
         );
 
         finish_telegram_message_deletion(&conn, &retry[0]).expect("finish");
-        assert!(due_telegram_message_deletions(&conn, u64::from(u32::MAX))
-            .expect("after finish")
-            .is_empty());
+        assert!(
+            due_telegram_message_deletions(&conn, u64::from(u32::MAX), 10)
+                .expect("after finish")
+                .is_empty()
+        );
+
+        for message_id in 1..=7 {
+            queue_telegram_message_deletion(&conn, "bot_a", "456", message_id, 8000)
+                .expect("queue backlog");
+        }
+        assert_eq!(
+            due_telegram_message_deletions(&conn, 8000, 5)
+                .expect("bounded")
+                .len(),
+            5,
+            "a backlog is worked through a few deletions per cycle"
+        );
     }
 
     #[test]

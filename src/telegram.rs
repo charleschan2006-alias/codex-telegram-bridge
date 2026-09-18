@@ -43,7 +43,8 @@ use self::api::{
     telegram_delete_message, telegram_delete_webhook, telegram_edit_message_text,
     telegram_from_user_id, telegram_get_updates, telegram_message_id,
     telegram_remove_inline_keyboard, telegram_send_chat_action, telegram_send_message,
-    telegram_send_text, telegram_send_text_message_id, telegram_updates_array,
+    telegram_send_text, telegram_send_text_message_id, telegram_send_text_to_chat,
+    telegram_updates_array,
 };
 use self::render::{
     prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
@@ -1830,7 +1831,7 @@ pub(crate) fn process_telegram_updates(
         .telegram
         .as_ref()
         .context("Telegram is not configured. Run setup first.")?;
-    retry_pending_message_deletions(conn, telegram, now, timeout)?;
+    retry_pending_message_deletions(conn, telegram, now, timeout, deadline)?;
     let bot_id = telegram_bot_id(&telegram.bot_token);
     let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
@@ -1869,21 +1870,30 @@ fn message_deletion_step(error: Option<&str>, created_at: u64, now: u64) -> Mess
     }
 }
 
+/// At most this many queued deletions are tried per cycle, so a backlog during a Telegram
+/// outage cannot hold up polling and App Server sync.
+const TELEGRAM_DELETIONS_PER_CYCLE: usize = 5;
+
 /// Retries queued deletions, such as secret answers. A failed Telegram call is retried on
 /// later cycles with backoff; once the deletion window closes, the user is told to delete the
 /// message themselves, and that warning is retried the same way until it is delivered, so the
-/// promise to delete is never silently dropped.
+/// promise to delete is never silently dropped. Stops at the cycle deadline.
 fn retry_pending_message_deletions(
     conn: &Connection,
     telegram: &TelegramConfig,
     now: u64,
     timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let bot_id = telegram_stable_bot_id(&telegram.bot_token);
-    for deletion in due_telegram_message_deletions(conn, now)? {
+    for deletion in due_telegram_message_deletions(conn, now, TELEGRAM_DELETIONS_PER_CYCLE)? {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        let same_bot = deletion.bot_id == bot_id;
         // Deleting in the stored chat still works after the bridge is re-paired with another
         // chat; only a different bot can no longer remove the message.
-        let error = if deletion.bot_id == bot_id {
+        let error = if same_bot {
             telegram_delete_message(telegram, &deletion.chat_id, deletion.message_id, timeout)
                 .err()
                 .map(|error| format!("{error:#}"))
@@ -1895,9 +1905,22 @@ fn retry_pending_message_deletions(
                 finish_telegram_message_deletion(conn, &deletion)?;
             }
             MessageDeletionStep::GiveUp => {
+                // The warning goes to the chat that holds the message. A different bot can
+                // only reach it when it is still the configured chat; otherwise there is no
+                // one to tell, and warning an unrelated chat would be worse.
+                if !same_bot && deletion.chat_id != telegram.chat_id {
+                    finish_telegram_message_deletion(conn, &deletion)?;
+                    continue;
+                }
                 // Keep the record until the warning is delivered: the outage that failed the
                 // deletion can fail the warning too, and then the user would learn nothing.
-                if telegram_send_text(telegram, TELEGRAM_SECRET_NOT_DELETED_TEXT, timeout).is_ok() {
+                let warned = telegram_send_text_to_chat(
+                    telegram,
+                    &deletion.chat_id,
+                    TELEGRAM_SECRET_NOT_DELETED_TEXT,
+                    timeout,
+                );
+                if warned.is_ok() {
                     finish_telegram_message_deletion(conn, &deletion)?;
                 } else {
                     record_failed_telegram_message_deletion(conn, &deletion, now)?;
@@ -1973,7 +1996,9 @@ fn process_telegram_update_batch(
                                 message_id,
                                 now,
                             )?;
-                            retry_pending_message_deletions(conn, telegram, now, timeout)?;
+                            retry_pending_message_deletions(
+                                conn, telegram, now, timeout, deadline,
+                            )?;
                         }
                     }
                     let outcome = answer_codex_question(

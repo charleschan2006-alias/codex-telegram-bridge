@@ -89,6 +89,23 @@ pub(crate) fn telegram_send_text(
     )
 }
 
+pub(crate) fn telegram_send_text_to_chat(
+    telegram: &TelegramConfig,
+    chat_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_send_message(
+        telegram,
+        &json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true
+        }),
+        timeout,
+    )
+}
+
 pub(crate) fn telegram_send_text_message_id(
     telegram: &TelegramConfig,
     text: &str,
