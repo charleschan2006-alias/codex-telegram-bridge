@@ -19,8 +19,9 @@ use crate::state::{
     delete_setting, due_telegram_message_deletions, expire_app_server_approval,
     finish_telegram_message_deletion, get_setting_number, get_telegram_current_project_id,
     insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
-    list_recent_thread_snapshots_from_db, lookup_pending_app_server_approval,
-    lookup_question_message_route, lookup_telegram_command_route, lookup_telegram_message_route,
+    list_recent_thread_snapshots_from_db, lookup_app_server_request,
+    lookup_pending_app_server_approval, lookup_question_message_route,
+    lookup_telegram_command_route, lookup_telegram_message_route,
     mark_app_server_approval_responded, mark_telegram_callback_route_used,
     mark_telegram_command_route_used, observed_workspaces_from_db, pending_question_answers,
     queue_telegram_message_deletion, record_action, record_failed_telegram_message_deletion,
@@ -602,6 +603,15 @@ fn deliver_prepared_telegram_delivery(
             .pointer("/result/message_id")
             .and_then(Value::as_i64)
             .context("Telegram sendMessage response missing result.message_id")?;
+        if message_ids.is_empty() {
+            // Bind the buttons to the first message before anything else can fail. A Reply
+            // to a question is recognised by this binding; without it, the Reply would fall
+            // through to the ordinary reply route and start a new Codex turn.
+            for route in &mut prepared.callback_routes {
+                route.message_id = Some(message_id);
+                update_telegram_callback_message_id(conn, &route.callback_id, message_id)?;
+            }
+        }
         if let Some(thread_id) = prepared.thread_id.as_deref() {
             insert_telegram_message_route(
                 conn,
@@ -617,10 +627,6 @@ fn deliver_prepared_telegram_delivery(
     let first_message_id = *message_ids
         .first()
         .context("Telegram delivery did not send any messages")?;
-    for route in &mut prepared.callback_routes {
-        route.message_id = Some(first_message_id);
-        update_telegram_callback_message_id(conn, &route.callback_id, first_message_id)?;
-    }
     if let Some(thread_id) = prepared.thread_id.as_deref() {
         clear_telegram_typing_indicator(conn, telegram, thread_id)?;
     }
@@ -996,6 +1002,18 @@ fn answer_codex_question(
         remaining,
         is_secret: question.is_secret,
     })
+}
+
+/// Whether Codex marked this question secret, whatever state its request is in now: a late
+/// reply to a settled secret question must still leave the chat.
+fn question_is_secret(conn: &Connection, question_key: &str, question_id: &str) -> Result<bool> {
+    Ok(
+        lookup_app_server_request(conn, question_key)?.is_some_and(|request| {
+            app_server_questions(&request)
+                .iter()
+                .any(|question| question.id == question_id && question.is_secret)
+        }),
+    )
 }
 
 /// Shows the outcome on the question message and removes its buttons. Best effort: the answer
@@ -1929,6 +1947,19 @@ fn process_telegram_update_batch(
                 // Replies to a question message answer that question and are never sent to
                 // Codex as a new turn, even once the question is settled.
                 if let Some(route) = extract_telegram_question_reply(conn, message, telegram)? {
+                    // Queue a secret reply's deletion before anything that can fail, so it
+                    // leaves the chat even when the answer cannot be delivered.
+                    if question_is_secret(conn, &route.question_key, &route.question_id)? {
+                        if let Some(message_id) = route.message_id {
+                            queue_telegram_message_deletion(
+                                conn,
+                                &telegram.chat_id,
+                                message_id,
+                                now,
+                            )?;
+                            retry_pending_message_deletions(conn, telegram, now, timeout)?;
+                        }
+                    }
                     let outcome = answer_codex_question(
                         conn,
                         config,
@@ -1946,17 +1977,6 @@ fn process_telegram_update_batch(
                             remaining,
                             is_secret,
                         } => {
-                            if is_secret {
-                                if let Some(message_id) = route.message_id {
-                                    queue_telegram_message_deletion(
-                                        conn,
-                                        &telegram.chat_id,
-                                        message_id,
-                                        now,
-                                    )?;
-                                    retry_pending_message_deletions(conn, telegram, now, timeout)?;
-                                }
-                            }
                             settle_question_message(
                                 telegram,
                                 Some(route.question_message_id),
@@ -3245,6 +3265,36 @@ mod tests {
             ),
             MessageDeletionStep::GiveUp
         );
+    }
+
+    #[test]
+    fn a_question_stays_secret_after_its_request_is_settled() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let key = store_question_request(
+            &conn,
+            &json!({
+                "id": 9,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "call_9",
+                    "isBlocking": true,
+                    "questions": [
+                        { "id": "token", "question": "Token?", "isSecret": true, "options": null },
+                        { "id": "name", "question": "Name?", "isSecret": false, "options": null }
+                    ]
+                }
+            }),
+        );
+        assert!(question_is_secret(&conn, &key, "token").expect("secret"));
+        assert!(!question_is_secret(&conn, &key, "name").expect("not secret"));
+        mark_app_server_approval_responded(&conn, &key, 2000).expect("respond");
+        assert!(
+            question_is_secret(&conn, &key, "token").expect("secret after response"),
+            "a late reply to a settled secret question must still be deleted"
+        );
+        assert!(!question_is_secret(&conn, "question_unknown", "token").expect("unknown"));
     }
 
     #[test]

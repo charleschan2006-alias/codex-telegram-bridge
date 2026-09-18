@@ -19,9 +19,9 @@ use crate::codex::{
 };
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event,
-    expire_stale_server_requests, lookup_pending_app_server_approval, pending_outbound_count,
+    expire_stale_blocking_requests, lookup_pending_app_server_approval, pending_outbound_count,
     prune_state_logs, record_transport_delivery, resolve_app_server_approval_request,
-    should_emit_for_away_window, state_db_path, thread_has_pending_server_request,
+    should_emit_for_away_window, state_db_path, thread_has_pending_blocking_request,
     transport_delivery_exists, upsert_app_server_approval_request, OutboxDeliverySummary,
 };
 use crate::telegram::{
@@ -276,7 +276,7 @@ fn reconcile_stale_questions(conn: &Connection, sync_result: &Value, now: u64) -
             .map(str::to_string)
             .collect::<Vec<_>>();
         if !status_flags_waiting_for_input(&status_flags) {
-            expire_stale_server_requests(conn, thread_id, APP_SERVER_USER_INPUT_METHOD, now)?;
+            expire_stale_blocking_requests(conn, thread_id, APP_SERVER_USER_INPUT_METHOD, now)?;
         }
     }
     Ok(())
@@ -370,7 +370,7 @@ fn collect_daemon_app_server_events(
                 Some("approval") => active_native_threads.contains(thread_id),
                 // `waitingOnUserInput` also marks a pending question, which gets its own
                 // answerable message; a generic "reply" nudge would start a separate turn.
-                Some("reply") => thread_has_pending_server_request(
+                Some("reply") => thread_has_pending_blocking_request(
                     conn,
                     thread_id,
                     APP_SERVER_USER_INPUT_METHOD,
@@ -1138,7 +1138,7 @@ mod tests {
         reconcile_stale_questions(&conn, &sync_result, 2000).expect("reconcile");
 
         let pending = |thread_id| {
-            thread_has_pending_server_request(&conn, thread_id, APP_SERVER_USER_INPUT_METHOD)
+            thread_has_pending_blocking_request(&conn, thread_id, APP_SERVER_USER_INPUT_METHOD)
                 .expect("lookup")
         };
         assert!(

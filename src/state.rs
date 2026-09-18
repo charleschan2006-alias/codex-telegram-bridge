@@ -1687,16 +1687,32 @@ pub(crate) fn upsert_app_server_approval_request(
     Ok(changed > 0)
 }
 
+/// A stored App Server request in any state (pending, responded, expired, or resolved).
+pub(crate) fn lookup_app_server_request(
+    conn: &Connection,
+    approval_key: &str,
+) -> Result<Option<AppServerApprovalRequest>> {
+    lookup_app_server_request_with_status(conn, approval_key, None)
+}
+
 pub(crate) fn lookup_pending_app_server_approval(
     conn: &Connection,
     approval_key: &str,
+) -> Result<Option<AppServerApprovalRequest>> {
+    lookup_app_server_request_with_status(conn, approval_key, Some("pending"))
+}
+
+fn lookup_app_server_request_with_status(
+    conn: &Connection,
+    approval_key: &str,
+    status: Option<&str>,
 ) -> Result<Option<AppServerApprovalRequest>> {
     let row = conn
         .query_row(
             "SELECT request_id_json, method, thread_id, turn_id, item_id, params_json
              FROM app_server_approval_requests
-             WHERE approval_key = ?1 AND status = 'pending'",
-            params![approval_key],
+             WHERE approval_key = ?1 AND (?2 IS NULL OR status = ?2)",
+            params![approval_key, status],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1888,11 +1904,15 @@ pub(crate) fn lookup_question_message_route(
     .map_err(Into::into)
 }
 
-/// Expires pending `method` requests of a thread that Codex no longer shows as waiting.
-/// `serverRequest/resolved` is missed while the daemon is down, and resolved requests are not
-/// replayed, so without this a stale row would stay pending forever. Requests first seen in
-/// this cycle are kept: the thread snapshot may predate them.
-pub(crate) fn expire_stale_server_requests(
+/// Requests are blocking unless their params say `isBlocking: false`. Only a blocking request
+/// makes Codex show the thread as waiting, so only those can be judged by thread status.
+const BLOCKING_REQUEST_SQL: &str = "COALESCE(json_extract(params_json, '$.isBlocking'), 1) != 0";
+
+/// Expires pending blocking `method` requests of a thread that Codex no longer shows as
+/// waiting. `serverRequest/resolved` is missed while the daemon is down, and resolved requests
+/// are not replayed, so without this a stale row would stay pending forever. Requests first
+/// seen in this cycle are kept: the thread snapshot may predate them.
+pub(crate) fn expire_stale_blocking_requests(
     conn: &Connection,
     thread_id: &str,
     method: &str,
@@ -1900,17 +1920,23 @@ pub(crate) fn expire_stale_server_requests(
 ) -> Result<usize> {
     let now = to_sql_i64(now)?;
     conn.execute(
-        "UPDATE telegram_callback_routes SET used_at = ?3
-         WHERE approval_key IN (
-             SELECT approval_key FROM app_server_approval_requests
-             WHERE thread_id = ?1 AND method = ?2 AND status = 'pending' AND created_at < ?3
-         ) AND used_at IS NULL",
+        &format!(
+            "UPDATE telegram_callback_routes SET used_at = ?3
+             WHERE approval_key IN (
+                 SELECT approval_key FROM app_server_approval_requests
+                 WHERE thread_id = ?1 AND method = ?2 AND status = 'pending'
+                   AND created_at < ?3 AND {BLOCKING_REQUEST_SQL}
+             ) AND used_at IS NULL"
+        ),
         params![thread_id, method, now],
     )?;
     let expired = conn.execute(
-        "UPDATE app_server_approval_requests
-         SET status = 'expired', resolved_at = ?3, answers_json = NULL
-         WHERE thread_id = ?1 AND method = ?2 AND status = 'pending' AND created_at < ?3",
+        &format!(
+            "UPDATE app_server_approval_requests
+             SET status = 'expired', resolved_at = ?3, answers_json = NULL
+             WHERE thread_id = ?1 AND method = ?2 AND status = 'pending'
+               AND created_at < ?3 AND {BLOCKING_REQUEST_SQL}"
+        ),
         params![thread_id, method, now],
     )?;
     Ok(expired)
@@ -1995,16 +2021,19 @@ pub(crate) fn record_failed_telegram_message_deletion(
     Ok(())
 }
 
-pub(crate) fn thread_has_pending_server_request(
+pub(crate) fn thread_has_pending_blocking_request(
     conn: &Connection,
     thread_id: &str,
     method: &str,
 ) -> Result<bool> {
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM app_server_approval_requests
-             WHERE thread_id = ?1 AND method = ?2 AND status = 'pending'
-             LIMIT 1",
+            &format!(
+                "SELECT 1 FROM app_server_approval_requests
+                 WHERE thread_id = ?1 AND method = ?2 AND status = 'pending'
+                   AND {BLOCKING_REQUEST_SQL}
+                 LIMIT 1"
+            ),
             params![thread_id, method],
             |row| row.get(0),
         )
@@ -2588,7 +2617,7 @@ mod tests {
         };
 
         assert!(
-            thread_has_pending_server_request(&conn, "thr_q", "item/tool/requestUserInput")
+            thread_has_pending_blocking_request(&conn, "thr_q", "item/tool/requestUserInput")
                 .expect("pending question")
         );
         assert!(
@@ -2629,7 +2658,7 @@ mod tests {
                 .expect("late answer")
         );
         assert!(
-            !thread_has_pending_server_request(&conn, "thr_q", "item/tool/requestUserInput")
+            !thread_has_pending_blocking_request(&conn, "thr_q", "item/tool/requestUserInput")
                 .expect("no pending question")
         );
     }
@@ -2637,7 +2666,7 @@ mod tests {
     #[test]
     fn stale_server_request_expiry_keeps_this_cycles_requests_and_other_methods() {
         let conn = create_state_db_in_memory().expect("db");
-        let store = |key: &str, method: &str, observed_at: u64| {
+        let store_with = |key: &str, method: &str, observed_at: u64, params: Value| {
             upsert_app_server_approval_request(
                 &conn,
                 &AppServerApprovalRequest {
@@ -2647,11 +2676,14 @@ mod tests {
                     thread_id: "thr_1".to_string(),
                     turn_id: "turn_1".to_string(),
                     item_id: key.to_string(),
-                    params: json!({}),
+                    params,
                 },
                 observed_at,
             )
             .expect("store");
+        };
+        let store = |key: &str, method: &str, observed_at: u64| {
+            store_with(key, method, observed_at, json!({ "isBlocking": true }))
         };
         let question = "item/tool/requestUserInput";
         store("question_old", question, 1000);
@@ -2660,6 +2692,14 @@ mod tests {
             "approval_old",
             "item/commandExecution/requestApproval",
             1000,
+        );
+        // A non-blocking question never makes the thread wait, so thread status says nothing
+        // about whether it is still live.
+        store_with(
+            "question_async",
+            question,
+            1000,
+            json!({ "isBlocking": false }),
         );
         insert_telegram_callback_route(
             &conn,
@@ -2678,7 +2718,7 @@ mod tests {
         .expect("route");
 
         assert_eq!(
-            expire_stale_server_requests(&conn, "thr_1", question, 2000).expect("expire"),
+            expire_stale_blocking_requests(&conn, "thr_1", question, 2000).expect("expire"),
             1
         );
         assert!(lookup_pending_app_server_approval(&conn, "question_old")
@@ -2690,6 +2730,20 @@ mod tests {
         assert!(lookup_pending_app_server_approval(&conn, "approval_old")
             .expect("approval")
             .is_some());
+        assert!(lookup_pending_app_server_approval(&conn, "question_async")
+            .expect("async question")
+            .is_some());
+        expire_stale_blocking_requests(&conn, "thr_1", question, 3000).expect("expire newer");
+        assert!(
+            !thread_has_pending_blocking_request(&conn, "thr_1", question).expect("blocking"),
+            "a pending non-blocking question must not suppress reply alerts"
+        );
+        assert!(
+            lookup_app_server_request(&conn, "question_old")
+                .expect("any status")
+                .is_some(),
+            "settled requests stay readable"
+        );
         let used: Option<i64> = conn
             .query_row(
                 "SELECT used_at FROM telegram_callback_routes WHERE callback_id = 'cb_old'",
