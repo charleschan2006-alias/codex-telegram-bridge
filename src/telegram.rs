@@ -1871,7 +1871,8 @@ fn message_deletion_step(error: Option<&str>, created_at: u64, now: u64) -> Mess
 
 /// Retries queued deletions, such as secret answers. A failed Telegram call is retried on
 /// later cycles with backoff; once the deletion window closes, the user is told to delete the
-/// message themselves, so the promise to delete is never silently dropped.
+/// message themselves, and that warning is retried the same way until it is delivered, so the
+/// promise to delete is never silently dropped.
 fn retry_pending_message_deletions(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -1894,8 +1895,13 @@ fn retry_pending_message_deletions(
                 finish_telegram_message_deletion(conn, &deletion)?;
             }
             MessageDeletionStep::GiveUp => {
-                finish_telegram_message_deletion(conn, &deletion)?;
-                let _ = telegram_send_text(telegram, TELEGRAM_SECRET_NOT_DELETED_TEXT, timeout);
+                // Keep the record until the warning is delivered: the outage that failed the
+                // deletion can fail the warning too, and then the user would learn nothing.
+                if telegram_send_text(telegram, TELEGRAM_SECRET_NOT_DELETED_TEXT, timeout).is_ok() {
+                    finish_telegram_message_deletion(conn, &deletion)?;
+                } else {
+                    record_failed_telegram_message_deletion(conn, &deletion, now)?;
+                }
             }
             MessageDeletionStep::Retry => {
                 record_failed_telegram_message_deletion(conn, &deletion, now)?;
