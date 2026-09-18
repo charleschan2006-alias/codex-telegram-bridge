@@ -188,10 +188,21 @@ fn telegram_question_callback_id(
     format!("cb_{}", &digest[..24])
 }
 
+/// Solid colour dots that tie each option button to its line in the message body.
+const OPTION_DOTS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
+
 fn option_letter(index: usize) -> String {
     char::from_u32('A' as u32 + index as u32)
         .filter(char::is_ascii_uppercase)
         .map_or_else(|| (index + 1).to_string(), String::from)
+}
+
+fn option_marker(index: usize) -> String {
+    format!(
+        "{}{}",
+        OPTION_DOTS[index % OPTION_DOTS.len()],
+        option_letter(index)
+    )
 }
 
 /// A question from `item/tool/requestUserInput`: option buttons plus Skip, and a Reply for
@@ -259,11 +270,11 @@ fn prepare_question_delivery(
         lines.push(String::new());
         for (position, (label, description)) in options.iter().enumerate() {
             if description.is_empty() || description == label {
-                lines.push(format!("{}. {label}", option_letter(position)));
+                lines.push(format!("{} {label}", option_marker(position)));
             } else {
                 lines.push(format!(
-                    "{}. {label} — {description}",
-                    option_letter(position)
+                    "{} {label} — {description}",
+                    option_marker(position)
                 ));
             }
         }
@@ -331,8 +342,8 @@ fn prepare_question_delivery(
             );
             keyboard.push(json!([{
                 "text": format!(
-                    "{}. {}",
-                    option_letter(position),
+                    "{} {}",
+                    option_marker(position),
                     trim_for_telegram_line(label, 60)
                 ),
                 "callback_data": callback_data,
@@ -875,8 +886,8 @@ mod tests {
         let text = prepared.payloads[0]["text"].as_str().expect("text");
         assert!(text.starts_with("❓ Codex has a question (1/2)\n🧵 Pick a color\n📁 demo"));
         assert!(text.contains("【Color】\nWhich color?"));
-        assert!(text.contains("A. Red (Recommended) — Warm"));
-        assert!(text.contains(&format!("B. {long_label}\n")));
+        assert!(text.contains("🔴A Red (Recommended) — Warm"));
+        assert!(text.contains(&format!("🟠B {long_label}\n")));
         assert!(text.contains("use Telegram's Reply on this message to type your own answer"));
         assert!(text.contains("once all 2 questions are answered or skipped"));
 
@@ -887,8 +898,8 @@ mod tests {
             .iter()
             .map(|row| row[0]["text"].as_str().expect("button text"))
             .collect::<Vec<_>>();
-        assert_eq!(buttons[0], "A. Red (Recommended)");
-        assert!(buttons[1].starts_with("B. A very long") && buttons[1].ends_with("..."));
+        assert_eq!(buttons[0], "🔴A Red (Recommended)");
+        assert!(buttons[1].starts_with("🟠B A very long") && buttons[1].ends_with("..."));
         assert_eq!(buttons[2], "⏭ Skip");
         for row in keyboard {
             let data = row[0]["callback_data"].as_str().expect("callback data");
@@ -927,6 +938,18 @@ mod tests {
             .map(|route| route.callback_id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), 3, "every button needs its own callback id");
+    }
+
+    #[test]
+    fn option_markers_pair_a_colour_dot_with_a_letter() {
+        assert_eq!(option_marker(0), "🔴A");
+        assert_eq!(option_marker(4), "🔵E");
+        assert_eq!(option_marker(7), "⚫H");
+        assert_eq!(
+            option_marker(8),
+            "🔴I",
+            "colours repeat after eight options"
+        );
     }
 
     #[test]
