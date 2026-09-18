@@ -1819,19 +1819,25 @@ pub(crate) fn process_telegram_updates(
     timeout: Duration,
     deadline: Option<Instant>,
 ) -> Result<Value> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Ok(json!({
-            "ok": true,
-            "transport": "telegram",
-            "seen": 0,
-            "skipped": "cycle_deadline"
-        }));
+    let skipped = json!({
+        "ok": true,
+        "transport": "telegram",
+        "seen": 0,
+        "skipped": "cycle_deadline"
+    });
+    if budgeted_timeout(timeout, deadline).is_none() {
+        return Ok(skipped);
     }
     let telegram = config
         .telegram
         .as_ref()
         .context("Telegram is not configured. Run setup first.")?;
     retry_pending_message_deletions(conn, telegram, now, timeout, deadline)?;
+    // Deletion retries during an outage can use up the cycle; polling then waits for the next
+    // cycle instead of pushing App Server sync further past the deadline.
+    let Some(timeout) = budgeted_timeout(timeout, deadline) else {
+        return Ok(skipped);
+    };
     let bot_id = telegram_bot_id(&telegram.bot_token);
     let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
@@ -1840,6 +1846,17 @@ pub(crate) fn process_telegram_updates(
     process_telegram_update_batch(
         conn, config, telegram, &bot_id, &key, updates, now, timeout, deadline,
     )
+}
+
+/// The request timeout, cut to what is left of the cycle budget; None once it is spent.
+fn budgeted_timeout(timeout: Duration, deadline: Option<Instant>) -> Option<Duration> {
+    match deadline {
+        None => Some(timeout),
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            (!remaining.is_zero()).then(|| timeout.min(remaining))
+        }
+    }
 }
 
 /// Telegram lets a bot delete a message for 48 hours; stop retrying a little before that.
@@ -1887,9 +1904,9 @@ fn retry_pending_message_deletions(
 ) -> Result<()> {
     let bot_id = telegram_stable_bot_id(&telegram.bot_token);
     for deletion in due_telegram_message_deletions(conn, now, TELEGRAM_DELETIONS_PER_CYCLE)? {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        let Some(timeout) = budgeted_timeout(timeout, deadline) else {
             break;
-        }
+        };
         let same_bot = deletion.bot_id == bot_id;
         // Deleting in the stored chat still works after the bridge is re-paired with another
         // chat; only a different bot can no longer remove the message.
@@ -3354,6 +3371,24 @@ mod tests {
 
         let short = settled_question_text("Q?", "✅ Answer: Blue\n📤 Sent to Codex.");
         assert_eq!(short, "Q?\n\n✅ Answer: Blue\n📤 Sent to Codex.");
+    }
+
+    #[test]
+    fn request_timeouts_are_cut_to_the_remaining_cycle_budget() {
+        let timeout = Duration::from_secs(10);
+        assert_eq!(budgeted_timeout(timeout, None), Some(timeout));
+        assert_eq!(
+            budgeted_timeout(timeout, Some(Instant::now() - Duration::from_secs(1))),
+            None,
+            "a spent budget skips the request"
+        );
+        let cut = budgeted_timeout(timeout, Some(Instant::now() + Duration::from_secs(2)))
+            .expect("budget left");
+        assert!(cut <= Duration::from_secs(2) && !cut.is_zero());
+        assert_eq!(
+            budgeted_timeout(timeout, Some(Instant::now() + Duration::from_secs(60))),
+            Some(timeout)
+        );
     }
 
     #[test]
