@@ -10,17 +10,31 @@ pub(crate) fn telegram_api_post(
     payload: &Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent();
     let url = format!(
         "https://api.telegram.org/bot{}/{}",
         bot_token.trim(),
         method.trim()
     );
+    telegram_api_post_url(&url, bot_token, method, payload, timeout)
+}
+
+fn telegram_api_post_url(
+    url: &str,
+    bot_token: &str,
+    method: &str,
+    payload: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        // Telegram explains a failed call in the JSON body of its 4xx response (for example
+        // "Bad Request: message to delete not found"). Read that body instead of letting
+        // ureq reduce the call to "http status: 400", so callers can act on the reason.
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
     let mut response = agent
-        .post(&url)
+        .post(url)
         .send_json(payload.clone())
         .map_err(|error| {
             anyhow!(
@@ -28,10 +42,11 @@ pub(crate) fn telegram_api_post(
                 crate::redact_secret_text(&error.to_string(), bot_token)
             )
         })?;
+    let status = response.status();
     let value: Value = response
         .body_mut()
         .read_json()
-        .with_context(|| format!("Telegram API {method} returned invalid JSON"))?;
+        .with_context(|| format!("Telegram API {method} returned invalid JSON (HTTP {status})"))?;
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         bail!("Telegram API {method} returned error: {value}");
     }
@@ -300,6 +315,73 @@ pub(crate) fn telegram_stable_bot_id(bot_token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    /// Serves one HTTP request with Telegram's usual 400 reply for a missing message.
+    fn spawn_telegram_error_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake telegram");
+        let url = format!(
+            "http://{}/bot123:secret/deleteMessage",
+            listener.local_addr().unwrap()
+        );
+        let join = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length || read == 0 {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"ok":false,"error_code":400,"description":"Bad Request: message to delete not found"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        (url, join)
+    }
+
+    #[test]
+    fn telegram_errors_keep_the_description_from_the_4xx_body() {
+        let (url, server) = spawn_telegram_error_server();
+
+        let error = telegram_api_post_url(
+            &url,
+            "123:secret",
+            "deleteMessage",
+            &json!({ "chat_id": "456", "message_id": 1 }),
+            Duration::from_secs(5),
+        )
+        .expect_err("a 400 reply is an error");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("message to delete not found"),
+            "the deletion retry logic keys on Telegram's description: {message}"
+        );
+        assert!(
+            !message.contains("secret"),
+            "the token must not leak: {message}"
+        );
+        server.join().expect("fake telegram");
+    }
 
     #[test]
     fn stable_bot_id_survives_token_rotation() {
