@@ -220,6 +220,31 @@ fn option_marker(index: usize) -> String {
     )
 }
 
+/// Telegram caps inline button text at 64 UTF-16 code units (most emoji take two).
+const TELEGRAM_BUTTON_TEXT_UTF16_LIMIT: usize = 64;
+
+fn option_button_text(position: usize, label: &str) -> String {
+    let text = format!(
+        "{} {}",
+        option_marker(position),
+        label.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    if text.encode_utf16().count() <= TELEGRAM_BUTTON_TEXT_UTF16_LIMIT {
+        return text;
+    }
+    // Leave one unit for the "…" that marks the cut.
+    let mut units = 0;
+    let mut truncated = text
+        .chars()
+        .take_while(|ch| {
+            units += ch.len_utf16();
+            units < TELEGRAM_BUTTON_TEXT_UTF16_LIMIT
+        })
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 /// A question from `item/tool/requestUserInput`: option buttons plus Skip, and a Reply for
 /// free-form answers when Codex allows one.
 fn prepare_question_delivery(
@@ -369,11 +394,7 @@ fn prepare_question_delivery(
                 Some(label.as_str()),
             );
             keyboard.push(json!([{
-                "text": format!(
-                    "{} {}",
-                    option_marker(position),
-                    trim_for_telegram_line(label, 60)
-                ),
+                "text": option_button_text(position, label),
                 "callback_data": callback_data,
             }]));
         }
@@ -927,7 +948,13 @@ mod tests {
             .map(|row| row[0]["text"].as_str().expect("button text"))
             .collect::<Vec<_>>();
         assert_eq!(buttons[0], "🔴A Red (Recommended)");
-        assert!(buttons[1].starts_with("🟠B A very long") && buttons[1].ends_with("..."));
+        assert!(buttons[1].starts_with("🟠B A very long") && buttons[1].ends_with('…'));
+        for button in &buttons {
+            assert!(
+                button.encode_utf16().count() <= 64,
+                "Telegram rejects button text over 64 UTF-16 units: {button}"
+            );
+        }
         assert_eq!(buttons[2], "⏭ Skip");
         for row in keyboard {
             let data = row[0]["callback_data"].as_str().expect("callback data");
@@ -1011,6 +1038,16 @@ mod tests {
             3,
             "both options and Skip keep their buttons"
         );
+    }
+
+    #[test]
+    fn option_buttons_fit_telegrams_utf16_limit_even_with_emoji_labels() {
+        let emoji_label = "🚀".repeat(40);
+        let text = option_button_text(0, &emoji_label);
+        assert!(text.starts_with("🔴A 🚀"));
+        assert!(text.ends_with('…'));
+        assert!(text.encode_utf16().count() <= TELEGRAM_BUTTON_TEXT_UTF16_LIMIT);
+        assert_eq!(option_button_text(1, "Blue\nsky"), "🟠B Blue sky");
     }
 
     #[test]
