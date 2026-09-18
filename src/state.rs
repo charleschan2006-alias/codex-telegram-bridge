@@ -476,14 +476,26 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM actions_log WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
-    // A question message's reply route goes with its buttons: a reply to it must never fall
-    // through to the ordinary thread route and start a turn once the question route is gone.
+    // A question message's reply route goes with its question binding: a reply to it must
+    // never fall through to the ordinary thread route and start a turn once the binding is gone.
     conn.execute(
         "DELETE FROM telegram_message_routes
          WHERE (chat_id, message_id) IN (
              SELECT chat_id, message_id FROM telegram_callback_routes
              WHERE created_at < ?1 AND used_at IS NOT NULL
                AND question_id IS NOT NULL AND message_id IS NOT NULL
+             UNION
+             SELECT chat_id, message_id FROM telegram_question_messages
+             WHERE created_at < ?1 AND question_key NOT IN (
+                 SELECT approval_key FROM app_server_approval_requests WHERE status = 'pending'
+             )
+         )",
+        params![sql_cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM telegram_question_messages
+         WHERE created_at < ?1 AND question_key NOT IN (
+             SELECT approval_key FROM app_server_approval_requests WHERE status = 'pending'
          )",
         params![sql_cutoff],
     )?;
@@ -589,6 +601,14 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           created_at INTEGER NOT NULL,
           responded_at INTEGER,
           resolved_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS telegram_question_messages (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          question_key TEXT NOT NULL,
+          question_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, message_id)
         );
         CREATE TABLE IF NOT EXISTS telegram_pending_deletions (
           bot_id TEXT NOT NULL,
@@ -1905,7 +1925,10 @@ pub(crate) fn lookup_question_message_route(
     message_id: i64,
 ) -> Result<Option<(String, String)>> {
     conn.query_row(
-        "SELECT approval_key, question_id FROM telegram_callback_routes
+        "SELECT question_key, question_id FROM telegram_question_messages
+         WHERE chat_id = ?1 AND message_id = ?2
+         UNION ALL
+         SELECT approval_key, question_id FROM telegram_callback_routes
          WHERE chat_id = ?1 AND message_id = ?2
            AND approval_key IS NOT NULL AND question_id IS NOT NULL
          LIMIT 1",
@@ -1914,6 +1937,32 @@ pub(crate) fn lookup_question_message_route(
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Records every delivered copy of a question message. An outbox retry after a crash can
+/// send a question twice; both copies must keep answering the question, never fall through
+/// to the ordinary reply route.
+pub(crate) fn record_telegram_question_message(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    question_key: &str,
+    question_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO telegram_question_messages(
+            chat_id, message_id, question_key, question_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            chat_id,
+            message_id,
+            question_key,
+            question_id,
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
 }
 
 /// Requests are blocking unless their params say `isBlocking: false`. Only a blocking request
@@ -3115,6 +3164,68 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
 
         assert!(path.ends_with(".codex-telegram-bridge/live-backend.json"));
+    }
+
+    #[test]
+    fn every_delivered_question_copy_stays_bound_until_pruned_together() {
+        let conn = create_state_db_in_memory().expect("db");
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = 40 * day_ms;
+        let store = |key: &str| {
+            upsert_app_server_approval_request(
+                &conn,
+                &AppServerApprovalRequest {
+                    approval_key: key.to_string(),
+                    request_id: json!(key),
+                    method: "item/tool/requestUserInput".to_string(),
+                    thread_id: "thr_1".to_string(),
+                    turn_id: "turn_1".to_string(),
+                    item_id: key.to_string(),
+                    params: json!({}),
+                },
+                0,
+            )
+            .expect("store");
+        };
+        store("question_done");
+        store("question_open");
+        mark_app_server_approval_responded(&conn, "question_done", 1).expect("settle");
+        // The original and a copy resent by an outbox retry, plus a still-open question.
+        for (message_id, key) in [
+            (50, "question_done"),
+            (60, "question_done"),
+            (70, "question_open"),
+        ] {
+            insert_telegram_message_route(&conn, "456", message_id, "thr_1", "event", 0)
+                .expect("message route");
+            record_telegram_question_message(&conn, "456", message_id, key, "q", 0)
+                .expect("question copy");
+        }
+        for message_id in [50, 60] {
+            assert_eq!(
+                lookup_question_message_route(&conn, "456", message_id).expect("copy"),
+                Some(("question_done".to_string(), "q".to_string()))
+            );
+        }
+
+        prune_state_logs(&conn, now).expect("prune");
+
+        for message_id in [50, 60] {
+            assert_eq!(
+                lookup_question_message_route(&conn, "456", message_id).expect("pruned"),
+                None
+            );
+            assert_eq!(
+                lookup_telegram_message_route(&conn, "456", message_id).expect("reply route"),
+                None,
+                "a pruned question copy must not reach the thread as a new turn"
+            );
+        }
+        assert_eq!(
+            lookup_question_message_route(&conn, "456", 70).expect("open"),
+            Some(("question_open".to_string(), "q".to_string())),
+            "a still-pending question keeps its binding"
+        );
     }
 
     #[test]

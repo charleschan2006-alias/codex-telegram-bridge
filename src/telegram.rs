@@ -25,8 +25,9 @@ use crate::state::{
     mark_app_server_approval_responded, mark_telegram_callback_route_used,
     mark_telegram_command_route_used, observed_workspaces_from_db, pending_question_answers,
     queue_telegram_message_deletion, record_action, record_failed_telegram_message_deletion,
-    record_pending_question_answer, record_telegram_inbound_processed, set_setting,
-    set_setting_text, set_telegram_current_project_id, telegram_inbound_processed,
+    record_pending_question_answer, record_telegram_inbound_processed,
+    record_telegram_question_message, set_setting, set_setting_text,
+    set_telegram_current_project_id, telegram_inbound_processed,
     update_telegram_callback_message_id, AppServerApprovalRequest, BridgeThreadSnapshot,
     TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
 };
@@ -505,7 +506,16 @@ pub(crate) fn extract_telegram_callback_route(
             "SELECT thread_id, action, approval_key, question_id, answer
              FROM telegram_callback_routes
              WHERE callback_id = ?1 AND chat_id = ?2 AND used_at IS NULL
-               AND (message_id IS NULL OR message_id = ?3)",
+               AND (
+                   message_id IS NULL OR message_id = ?3
+                   -- Any delivered copy of the same question, e.g. after an outbox retry.
+                   OR EXISTS (
+                       SELECT 1 FROM telegram_question_messages AS copy
+                       WHERE copy.chat_id = ?2 AND copy.message_id = ?3
+                         AND copy.question_key = telegram_callback_routes.approval_key
+                         AND copy.question_id = telegram_callback_routes.question_id
+                   )
+               )",
             params![callback_id, chat_id, message_id],
             |row| {
                 Ok((
@@ -609,7 +619,26 @@ fn deliver_prepared_telegram_delivery(
         if message_ids.is_empty() {
             // Bind the buttons to the first message before anything else can fail. A Reply
             // to a question is recognised by this binding; without it, the Reply would fall
-            // through to the ordinary reply route and start a new Codex turn.
+            // through to the ordinary reply route and start a new Codex turn. Each delivered
+            // copy of a question is recorded, so a copy sent again by an outbox retry does
+            // not strand the original.
+            if let Some((question_key, question_id)) =
+                prepared.callback_routes.iter().find_map(|route| {
+                    Some((
+                        route.approval_key.as_deref()?,
+                        route.question_id.as_deref()?,
+                    ))
+                })
+            {
+                record_telegram_question_message(
+                    conn,
+                    &telegram.chat_id,
+                    message_id,
+                    question_key,
+                    question_id,
+                    now,
+                )?;
+            }
             for route in &mut prepared.callback_routes {
                 route.message_id = Some(message_id);
                 update_telegram_callback_message_id(conn, &route.callback_id, message_id)?;
@@ -3327,6 +3356,65 @@ mod tests {
                 created
             ),
             MessageDeletionStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn question_buttons_work_on_every_delivered_copy_of_the_question() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        };
+        insert_telegram_callback_route(
+            &conn,
+            &crate::state::TelegramCallbackRoute {
+                callback_id: "cb_q".to_string(),
+                chat_id: "456".to_string(),
+                // Rebound to the copy an outbox retry sent last.
+                message_id: Some(60),
+                thread_id: "thr_1".to_string(),
+                action: TelegramCallbackAction::AnswerOption,
+                approval_key: Some("question_1".to_string()),
+                question_id: Some("color".to_string()),
+                answer: Some("Blue".to_string()),
+            },
+            1000,
+        )
+        .expect("route");
+        for message_id in [50, 60] {
+            crate::state::record_telegram_question_message(
+                &conn,
+                "456",
+                message_id,
+                "question_1",
+                "color",
+                1000,
+            )
+            .expect("copy");
+        }
+        let tap = |message_id: i64| {
+            json!({
+                "id": "cbq",
+                "from": { "id": 789 },
+                "data": "codex:cb_q",
+                "message": { "message_id": message_id, "chat": { "id": 456 } }
+            })
+        };
+
+        let original = extract_telegram_callback_route(&conn, &tap(50), &telegram)
+            .expect("extract original")
+            .expect("the original copy still answers the question");
+        assert_eq!(original.answer.as_deref(), Some("Blue"));
+        assert!(extract_telegram_callback_route(&conn, &tap(60), &telegram)
+            .expect("extract copy")
+            .is_some());
+        assert!(
+            extract_telegram_callback_route(&conn, &tap(70), &telegram)
+                .expect("extract unrelated")
+                .is_none(),
+            "a button id replayed on an unrelated message is rejected"
         );
     }
 
