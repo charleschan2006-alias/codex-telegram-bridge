@@ -1426,10 +1426,6 @@ mod tests {
         }
     }
 
-    fn live_test_lock() -> &'static Mutex<()> {
-        crate::state::test_env_lock()
-    }
-
     fn shared_codex_config(websocket_url: &str) -> CodexConfig {
         CodexConfig {
             live_mode: crate::CodexLiveMode::Shared,
@@ -1458,7 +1454,7 @@ mod tests {
 
     #[test]
     fn optional_status_reports_idle_without_health_error_when_backend_is_not_required() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("optional-idle");
         let websocket_url = random_websocket_url();
 
@@ -1475,7 +1471,7 @@ mod tests {
 
     #[test]
     fn optional_status_clears_stale_pid_when_backend_is_not_required() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("optional-stale-pid");
         let websocket_url = random_websocket_url();
         let mut stale = empty_live_backend_status(&shared_codex_config(&websocket_url));
@@ -1494,7 +1490,7 @@ mod tests {
 
     #[test]
     fn required_status_reports_unhealthy_when_backend_is_missing() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("required-unhealthy");
         let websocket_url = random_websocket_url();
 
@@ -1509,7 +1505,7 @@ mod tests {
 
     #[test]
     fn reconcile_live_backend_defers_until_retry_time() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reconcile-defer");
         let websocket_url = random_websocket_url();
         let mut status = empty_live_backend_status(&shared_codex_config(&websocket_url));
@@ -1659,7 +1655,7 @@ mod tests {
 
     #[test]
     fn ensure_live_backend_reuses_healthy_backend() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reuse");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1698,7 +1694,7 @@ mod tests {
 
     #[test]
     fn ensure_live_backend_restarts_when_codex_home_changes() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let home = TempHome::new("codex-home-change");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1733,7 +1729,7 @@ mod tests {
 
     #[test]
     fn reset_live_backend_restarts_unhealthy_backend() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reset");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1771,7 +1767,7 @@ mod tests {
 
     #[test]
     fn wait_for_live_backend_rejects_dead_managed_pid_even_if_socket_is_healthy() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("dead-pid");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1795,7 +1791,7 @@ mod tests {
 
     #[test]
     fn live_backend_status_replaces_stale_pid_with_discovered_backend() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("status-dead-pid");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1834,7 +1830,7 @@ mod tests {
 
     #[test]
     fn live_backend_status_adopts_managed_process_when_status_file_is_missing() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("status-adopt");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1854,7 +1850,7 @@ mod tests {
 
     #[test]
     fn terminate_managed_backend_pid_requires_matching_process_start_key() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("terminate-start-key");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1874,7 +1870,7 @@ mod tests {
 
     #[test]
     fn reset_live_backend_backfills_legacy_status_before_terminating() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reset-legacy-start-key");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1911,7 +1907,7 @@ mod tests {
 
     #[test]
     fn wait_for_managed_backend_pid_exit_stops_on_process_identity_mismatch() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("wait-start-key");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -1972,7 +1968,7 @@ mod tests {
 
     #[test]
     fn reset_live_backend_does_not_terminate_pid_that_does_not_match_recorded_url() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reset-stale-pid");
         let current_url = random_websocket_url();
         let stale_recorded_url = random_websocket_url();
@@ -2009,7 +2005,7 @@ mod tests {
 
     #[test]
     fn reset_live_backend_refuses_unowned_backend_when_status_file_is_missing() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reset-discover");
         let websocket_url = random_websocket_url();
         let _env = LiveTestEnv::fake_spawn();
@@ -2029,7 +2025,7 @@ mod tests {
 
     #[test]
     fn ensure_live_backend_rejects_non_loopback_url_before_spawning() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("reject-non-loopback");
         let _env = LiveTestEnv::fake_spawn();
         let before_count = test_backend_registry()
@@ -2056,7 +2052,7 @@ mod tests {
 
     #[test]
     fn live_backend_lock_is_released_on_drop() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("lock-release");
 
         let lock = acquire_live_backend_lock().expect("acquire lock");
@@ -2070,7 +2066,7 @@ mod tests {
 
     #[test]
     fn write_live_backend_status_replaces_existing_status_without_tmp_leftover() {
-        let _guard = live_test_lock().lock().expect("live test lock");
+        let _guard = crate::state::lock_test_env();
         let _home = TempHome::new("atomic-status");
         let websocket_url = random_websocket_url();
         let initial = LiveBackendStatus {

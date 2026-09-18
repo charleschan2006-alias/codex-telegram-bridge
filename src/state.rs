@@ -711,6 +711,18 @@ pub(crate) fn state_dir_path() -> Result<PathBuf> {
 
     let home = env::var("HOME").context("HOME is not set")?;
     let dir = PathBuf::from(home).join(".codex-telegram-bridge");
+    // Tests never touch the developer's real bridge state (config, remote mode, backend
+    // status). The HOME-based default is kept only when a test points HOME into the temp dir;
+    // otherwise, a test that sets neither gets a private per-process directory.
+    #[cfg(test)]
+    let dir = if dir.starts_with(env::temp_dir()) {
+        dir
+    } else {
+        env::temp_dir().join(format!(
+            "codex-telegram-bridge-test-state-{}",
+            std::process::id()
+        ))
+    };
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -728,10 +740,16 @@ pub(crate) fn live_backend_status_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("live-backend.json"))
 }
 
+/// Serializes every test that changes process-wide environment (state dir, HOME, fake-spawn
+/// switches) or the files those select. One lock for the whole crate: tests guarded by
+/// different locks used to race and could act on the developer's real bridge state.
+/// A poisoned lock is recovered, so one failing test does not fail every later one.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub(crate) fn get_setting_number(conn: &Connection, key: &str) -> Result<Option<u64>> {
@@ -3138,8 +3156,36 @@ mod tests {
     }
 
     #[test]
+    fn tests_never_resolve_the_real_home_state_directory() {
+        let _guard = lock_test_env();
+        let previous_home = std::env::var("HOME").ok();
+        let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+        std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+        // Like a developer's real home: not inside the temp dir.
+        std::env::set_var("HOME", "/home/not-a-temp-home");
+
+        let dir = state_dir_path();
+
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(previous_state_dir) = previous_state_dir {
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+        }
+        let dir = dir.expect("state dir");
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "a test without a state dir must get a private temp dir, got {}",
+            dir.display()
+        );
+        assert!(!dir.starts_with("/home/not-a-temp-home"));
+    }
+
+    #[test]
     fn live_backend_status_path_uses_bridge_state_directory() {
-        let _guard = test_env_lock().lock().expect("test env lock");
+        let _guard = crate::state::lock_test_env();
         let home =
             std::env::temp_dir().join(format!("codex-live-state-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);

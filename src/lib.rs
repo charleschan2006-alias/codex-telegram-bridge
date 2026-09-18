@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn remote_status_reports_missing_config_without_failing() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let state = TempStateDir::new("remote-status-missing-config");
 
         let status = remote_mode_status_result().expect("remote status");
@@ -1699,7 +1699,7 @@ mod tests {
 
     #[test]
     fn remote_status_reports_idle_backend_when_remote_mode_is_off() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _state = TempStateDir::new("remote-status-idle-backend");
         let websocket_url = "ws://127.0.0.1:9";
         write_daemon_config(&DaemonConfig {
@@ -1730,7 +1730,7 @@ mod tests {
 
     #[test]
     fn remote_off_clears_pending_notifications() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _state = TempStateDir::new("remote-off-clears-pending");
         let conn = create_state_db(&state_db_path().expect("state db path")).expect("db");
         set_away_mode(&conn, true, 1000).expect("away on");
@@ -1913,7 +1913,7 @@ mod tests {
 
     #[test]
     fn reset_dry_run_reports_runtime_files_and_preserves_config() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let state = TempStateDir::new("reset-dry-run");
         write_daemon_config(&DaemonConfig {
             version: 4,
@@ -1971,7 +1971,7 @@ mod tests {
 
     #[test]
     fn reset_removes_runtime_state_and_preserves_config() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let state = TempStateDir::new("reset-removes");
         // A non-dry-run reset stops the installed daemon service when it is running.
         let _home = TempHome::new(state.root.join("home"));

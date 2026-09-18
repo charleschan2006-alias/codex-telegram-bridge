@@ -2415,7 +2415,7 @@ mod tests {
     use crate::state::{
         archive_from_db, classify_inbox_item, create_state_db_in_memory, get_thread_history,
         list_inbox_from_db, reconcile_thread_snapshots, record_action, resolve_archive_targets,
-        test_env_lock, unarchive_thread_result, upsert_thread_snapshot, watch_once_from_db,
+        unarchive_thread_result, upsert_thread_snapshot, watch_once_from_db,
     };
     use crate::{get_away_mode, set_away_mode};
     use serde_json::json;
@@ -2498,7 +2498,7 @@ mod tests {
     fn resolve_codex_binary_prefers_platform_binary_before_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let root = std::env::temp_dir().join(format!("codex-resolve-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
@@ -2813,7 +2813,7 @@ mod tests {
     fn app_server_client_collects_notifications_between_requests() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let root = std::env::temp_dir().join(format!(
             "codex-async-notification-test-{}",
             std::process::id()
@@ -3256,7 +3256,7 @@ raise SystemExit(1)
 
     #[test]
     fn websocket_app_server_client_times_out_when_initialize_never_returns() {
-        let _guard = test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _timeout = WsTimeoutEnv::set(100);
         use std::net::TcpListener;
 
@@ -3296,7 +3296,7 @@ raise SystemExit(1)
 
     #[test]
     fn websocket_app_server_client_times_out_when_initialize_only_gets_keepalives() {
-        let _guard = test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _timeout = WsTimeoutEnv::set(100);
         use std::net::TcpListener;
 
@@ -3885,7 +3885,7 @@ raise SystemExit(1)
 
     #[test]
     fn away_mode_writes_remote_mode_status_marker() {
-        let _guard = test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let state_dir = TempStateDir::new("remote-mode-marker");
         let conn = create_state_db_in_memory().expect("db");
 

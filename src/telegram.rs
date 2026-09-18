@@ -2525,15 +2525,9 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::mpsc::{self, Receiver};
-    use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
 
     use crate::{daemon_config_path, write_daemon_config, DaemonConfig, TelegramConfig};
-
-    fn config_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct LiveCommandEnv {
         root: PathBuf,
@@ -2757,7 +2751,7 @@ mod tests {
 
     #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         if let Ok(path) = daemon_config_path() {
             let _ = fs::remove_file(path);
@@ -3499,7 +3493,7 @@ mod tests {
 
     #[test]
     fn remote_commands_start_stop_and_repair_shared_backend() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _env = LiveCommandEnv::new("start-reset");
         let websocket_url = random_websocket_url();
         write_daemon_config(&DaemonConfig {
@@ -3590,7 +3584,7 @@ mod tests {
 
     #[test]
     fn live_mode_command_failures_are_reported_to_telegram() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _env = LiveCommandEnv::new("failure-response");
         let conn = crate::state::create_state_db_in_memory().expect("db");
         let telegram = TelegramConfig {
@@ -3624,7 +3618,7 @@ mod tests {
 
     #[test]
     fn failing_telegram_update_is_acked_and_does_not_block_later_updates() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _env = LiveCommandEnv::new("failing-update-batch");
         let config = DaemonConfig {
             version: 4,

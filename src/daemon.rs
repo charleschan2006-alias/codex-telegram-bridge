@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn daemon_service_exports_developer_tool_path() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let previous_home = std::env::var_os("HOME");
         let previous_path = std::env::var_os("PATH");
         let root =
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn daemon_backend_reconciliation_is_idle_while_remote_mode_is_off() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _state = TempStateDir::new("remote-off");
         let conn = create_state_db_in_memory().expect("db");
         let config = DaemonConfig {
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn daemon_backend_reconciliation_starts_backend_while_remote_mode_is_on() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::lock_test_env();
         let _state = TempStateDir::new("remote-on");
         let _spawn = FakeSpawnEnv::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind random port");

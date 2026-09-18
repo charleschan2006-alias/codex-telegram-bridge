@@ -271,12 +271,6 @@ pub(crate) fn effective_codex_home(config: &CodexConfig) -> Result<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
-
-    fn config_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct ConfigBackup {
         path: std::path::PathBuf,
@@ -409,7 +403,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_requires_shared_codex_config() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         write_daemon_config(&DaemonConfig {
             version: 4,
@@ -434,7 +428,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_rejects_non_loopback_shared_websocket_url() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         write_daemon_config(&DaemonConfig {
             version: 4,
@@ -464,7 +458,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_backfills_shared_codex_config_for_legacy_versions() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         write_daemon_config(&DaemonConfig {
             version: 3,
@@ -487,7 +481,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_uses_default_codex_home_for_version_four_config() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         write_daemon_config(&DaemonConfig {
             version: 4,
@@ -517,7 +511,7 @@ mod tests {
 
     #[test]
     fn read_daemon_config_raw_backfills_shared_codex_config_for_legacy_versions() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = crate::state::lock_test_env();
         let _backup = ConfigBackup::capture().expect("capture config backup");
         write_daemon_config(&DaemonConfig {
             version: 3,
