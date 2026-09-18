@@ -21,7 +21,7 @@ const TELEGRAM_APPROVAL_HINT: &str =
     "Choose one option below. The button is bound to this exact Codex request.";
 const TELEGRAM_INFERRED_APPROVAL_HINT: &str =
     "Open the active Codex client to answer this approval.";
-const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+pub(crate) const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
 const TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT: usize = 3000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +191,21 @@ fn telegram_question_callback_id(
 /// Solid colour dots that tie each option button to its line in the message body.
 const OPTION_DOTS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
 
+/// Cuts `value` to at most `max_chars` characters, marking a cut with a trailing "…".
+pub(crate) fn truncate_to_char_limit(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    if max_chars > 0 {
+        truncated.push('…');
+    }
+    truncated
+}
+
 fn option_letter(index: usize) -> String {
     char::from_u32('A' as u32 + index as u32)
         .filter(char::is_ascii_uppercase)
@@ -254,32 +269,32 @@ fn prepare_question_delivery(
     } else {
         "❓ Codex has a question".to_string()
     };
-    let mut lines = vec![title, format!("🧵 {}", telegram_event_display_name(event))];
+    let mut head = vec![title, format!("🧵 {}", telegram_event_display_name(event))];
     if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
-        lines.push(format!("📁 {project}"));
+        head.push(format!("📁 {project}"));
     }
-    lines.push(String::new());
+    head.push(String::new());
     if !text("header").is_empty() {
-        lines.push(format!("【{}】", text("header")));
+        head.push(format!("【{}】", text("header")));
     }
-    lines.push(text("question").to_string());
     let described = options
         .iter()
         .any(|(label, description)| !description.is_empty() && description != label);
+    let mut option_lines = Vec::new();
     if described {
-        lines.push(String::new());
+        option_lines.push(String::new());
         for (position, (label, description)) in options.iter().enumerate() {
             if description.is_empty() || description == label {
-                lines.push(format!("{} {label}", option_marker(position)));
+                option_lines.push(format!("{} {label}", option_marker(position)));
             } else {
-                lines.push(format!(
+                option_lines.push(format!(
                     "{} {label} — {description}",
                     option_marker(position)
                 ));
             }
         }
     }
-    lines.push(String::new());
+    let mut lines = vec![String::new()];
     lines.push(
         match (options.is_empty(), accepts_free_text) {
             (true, _) => "💬 Use Telegram's Reply on this message to type your answer.",
@@ -301,17 +316,30 @@ fn prepare_question_delivery(
             "Codex gets the answers once all {total} questions are answered or skipped."
         ));
     }
+    let tail = lines;
 
-    let mut payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
-        .into_iter()
-        .map(|text| {
-            json!({
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": true
-            })
-        })
-        .collect::<Vec<_>>();
+    // A question is always one message: its buttons and Reply routing are bound to a single
+    // message id, and a split delivery that fails half way could strand that binding.
+    // Option descriptions go first (the buttons still show the labels), then the question
+    // text is cut to fit.
+    let compose = |question_text: &str, option_lines: &[String]| {
+        let mut all = head.clone();
+        all.push(question_text.to_string());
+        all.extend(option_lines.iter().cloned());
+        all.extend(tail.iter().cloned());
+        all.join("\n")
+    };
+    let mut body = compose(text("question"), &option_lines);
+    if body.chars().count() > TELEGRAM_MESSAGE_CHAR_LIMIT {
+        let budget = TELEGRAM_MESSAGE_CHAR_LIMIT.saturating_sub(compose("", &[]).chars().count());
+        body = compose(&truncate_to_char_limit(text("question"), budget), &[]);
+    }
+    let body = truncate_to_char_limit(&body, TELEGRAM_MESSAGE_CHAR_LIMIT);
+    let mut payloads = vec![json!({
+        "chat_id": chat_id,
+        "text": body,
+        "disable_web_page_preview": true
+    })];
 
     let mut callback_routes = Vec::new();
     let question_key = question.get("questionKey").and_then(Value::as_str);
@@ -938,6 +966,59 @@ mod tests {
             .map(|route| route.callback_id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), 3, "every button needs its own callback id");
+    }
+
+    #[test]
+    fn an_oversized_question_is_cut_to_one_message_that_keeps_its_buttons() {
+        let long_question = "Why? ".repeat(2000);
+        let long_description = "detail ".repeat(700);
+        let event = json!({
+            "type": "thread_waiting",
+            "eventKey": "question_big:q",
+            "threadId": "thr_q",
+            "questionRequest": {
+                "questionKey": "question_big",
+                "questionId": "q",
+                "index": 1,
+                "total": 1,
+                "header": "Big",
+                "question": long_question,
+                "isOther": true,
+                "isSecret": false,
+                "options": [
+                    { "label": "Yes", "description": long_description },
+                    { "label": "No", "description": long_description }
+                ]
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("456", &event).expect("prepare question");
+
+        assert_eq!(prepared.payloads.len(), 1, "a question is never split");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT);
+        assert!(text.contains("【Big】\nWhy? Why?"));
+        assert!(text.contains("…\n\nTap an option, or use Telegram's Reply"));
+        assert!(
+            !text.contains("detail detail"),
+            "descriptions are dropped first"
+        );
+        let keyboard = prepared.payloads[0]["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("keyboard");
+        assert_eq!(
+            keyboard.len(),
+            3,
+            "both options and Skip keep their buttons"
+        );
+    }
+
+    #[test]
+    fn truncation_marks_the_cut_and_respects_the_limit() {
+        assert_eq!(truncate_to_char_limit("short", 10), "short");
+        assert_eq!(truncate_to_char_limit("abcdef", 4), "abc…");
+        assert_eq!(truncate_to_char_limit("漢字漢字漢字", 3), "漢字…");
+        assert_eq!(truncate_to_char_limit("abc", 0), "");
     }
 
     #[test]

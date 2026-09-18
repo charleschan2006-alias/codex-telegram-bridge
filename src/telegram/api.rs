@@ -214,6 +214,7 @@ pub(crate) fn telegram_remove_inline_keyboard(
 
 pub(crate) fn telegram_delete_message(
     telegram: &TelegramConfig,
+    chat_id: &str,
     message_id: i64,
     timeout: Duration,
 ) -> Result<Value> {
@@ -221,7 +222,7 @@ pub(crate) fn telegram_delete_message(
         &telegram.bot_token,
         "deleteMessage",
         &json!({
-            "chat_id": telegram.chat_id,
+            "chat_id": chat_id,
             "message_id": message_id
         }),
         timeout,

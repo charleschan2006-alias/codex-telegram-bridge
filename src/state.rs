@@ -580,12 +580,13 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           resolved_at INTEGER
         );
         CREATE TABLE IF NOT EXISTS telegram_pending_deletions (
+          bot_id TEXT NOT NULL,
           chat_id TEXT NOT NULL,
           message_id INTEGER NOT NULL,
           created_at INTEGER NOT NULL,
           attempts INTEGER NOT NULL DEFAULT 0,
           next_attempt_at INTEGER NOT NULL,
-          PRIMARY KEY(chat_id, message_id)
+          PRIMARY KEY(bot_id, chat_id, message_id)
         );
         CREATE TABLE IF NOT EXISTS telegram_command_routes (
           chat_id TEXT NOT NULL,
@@ -1944,6 +1945,8 @@ pub(crate) fn expire_stale_blocking_requests(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingTelegramDeletion {
+    /// Only this bot can delete the message; the chat it is in may no longer be configured.
+    pub(crate) bot_id: String,
     pub(crate) chat_id: String,
     pub(crate) message_id: i64,
     pub(crate) created_at: u64,
@@ -1954,15 +1957,16 @@ pub(crate) struct PendingTelegramDeletion {
 /// instead of leaving, for example, a secret answer in the chat.
 pub(crate) fn queue_telegram_message_deletion(
     conn: &Connection,
+    bot_id: &str,
     chat_id: &str,
     message_id: i64,
     now: u64,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO telegram_pending_deletions(
-            chat_id, message_id, created_at, attempts, next_attempt_at
-         ) VALUES (?1, ?2, ?3, 0, ?3)",
-        params![chat_id, message_id, to_sql_i64(now)?],
+            bot_id, chat_id, message_id, created_at, attempts, next_attempt_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?4)",
+        params![bot_id, chat_id, message_id, to_sql_i64(now)?],
     )?;
     Ok(())
 }
@@ -1972,17 +1976,18 @@ pub(crate) fn due_telegram_message_deletions(
     now: u64,
 ) -> Result<Vec<PendingTelegramDeletion>> {
     let mut stmt = conn.prepare(
-        "SELECT chat_id, message_id, created_at, attempts FROM telegram_pending_deletions
+        "SELECT bot_id, chat_id, message_id, created_at, attempts FROM telegram_pending_deletions
          WHERE next_attempt_at <= ?1
          ORDER BY created_at",
     )?;
     let rows = stmt
         .query_map(params![to_sql_i64(now)?], |row| {
             Ok(PendingTelegramDeletion {
-                chat_id: row.get(0)?,
-                message_id: row.get(1)?,
-                created_at: row.get::<_, i64>(2)?.max(0) as u64,
-                attempts: row.get::<_, i64>(3)?.clamp(0, i64::from(u32::MAX)) as u32,
+                bot_id: row.get(0)?,
+                chat_id: row.get(1)?,
+                message_id: row.get(2)?,
+                created_at: row.get::<_, i64>(3)?.max(0) as u64,
+                attempts: row.get::<_, i64>(4)?.clamp(0, i64::from(u32::MAX)) as u32,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1991,12 +1996,12 @@ pub(crate) fn due_telegram_message_deletions(
 
 pub(crate) fn finish_telegram_message_deletion(
     conn: &Connection,
-    chat_id: &str,
-    message_id: i64,
+    deletion: &PendingTelegramDeletion,
 ) -> Result<()> {
     conn.execute(
-        "DELETE FROM telegram_pending_deletions WHERE chat_id = ?1 AND message_id = ?2",
-        params![chat_id, message_id],
+        "DELETE FROM telegram_pending_deletions
+         WHERE bot_id = ?1 AND chat_id = ?2 AND message_id = ?3",
+        params![deletion.bot_id, deletion.chat_id, deletion.message_id],
     )?;
     Ok(())
 }
@@ -2010,9 +2015,10 @@ pub(crate) fn record_failed_telegram_message_deletion(
     let backoff_ms = (2_000u64 << deletion.attempts.min(9)).min(600_000);
     conn.execute(
         "UPDATE telegram_pending_deletions
-         SET attempts = attempts + 1, next_attempt_at = ?3
-         WHERE chat_id = ?1 AND message_id = ?2",
+         SET attempts = attempts + 1, next_attempt_at = ?4
+         WHERE bot_id = ?1 AND chat_id = ?2 AND message_id = ?3",
         params![
+            deletion.bot_id,
             deletion.chat_id,
             deletion.message_id,
             to_sql_i64(now.saturating_add(backoff_ms))?
@@ -2757,8 +2763,8 @@ mod tests {
     #[test]
     fn queued_message_deletions_back_off_until_finished() {
         let conn = create_state_db_in_memory().expect("db");
-        queue_telegram_message_deletion(&conn, "456", 77, 1000).expect("queue");
-        queue_telegram_message_deletion(&conn, "456", 77, 1500).expect("queue twice");
+        queue_telegram_message_deletion(&conn, "bot_a", "456", 77, 1000).expect("queue");
+        queue_telegram_message_deletion(&conn, "bot_a", "456", 77, 1500).expect("queue twice");
 
         let due = due_telegram_message_deletions(&conn, 1000).expect("due");
         assert_eq!(
@@ -2768,6 +2774,11 @@ mod tests {
         );
         assert_eq!(due[0].created_at, 1000);
         assert_eq!(due[0].attempts, 0);
+        assert_eq!(
+            (due[0].bot_id.as_str(), due[0].chat_id.as_str()),
+            ("bot_a", "456"),
+            "a deletion remembers which bot and chat hold the message"
+        );
 
         record_failed_telegram_message_deletion(&conn, &due[0], 1000).expect("fail once");
         assert!(due_telegram_message_deletions(&conn, 2999)
@@ -2786,7 +2797,7 @@ mod tests {
             1
         );
 
-        finish_telegram_message_deletion(&conn, "456", 77).expect("finish");
+        finish_telegram_message_deletion(&conn, &retry[0]).expect("finish");
         assert!(due_telegram_message_deletions(&conn, u64::from(u32::MAX))
             .expect("after finish")
             .is_empty());

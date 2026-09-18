@@ -48,7 +48,8 @@ use self::api::{
 use self::render::{
     prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
     telegram_new_thread_confirmation_text, telegram_project_text, telegram_projects_text,
-    telegram_status_text, PreparedTelegramDelivery,
+    telegram_status_text, truncate_to_char_limit, PreparedTelegramDelivery,
+    TELEGRAM_MESSAGE_CHAR_LIMIT,
 };
 
 pub(crate) use self::api::{telegram_bot_id, telegram_set_my_commands};
@@ -1029,20 +1030,25 @@ fn settle_question_message(
         return;
     };
     let edited = original_text.map(|original| {
-        let text = format!("{}\n\n{outcome}", original.trim_end());
-        let text = if text.chars().count() > 4096 {
-            format!(
-                "{}\n\n{outcome}",
-                original.chars().take(3900).collect::<String>().trim_end()
-            )
-        } else {
-            text
-        };
-        telegram_edit_message_text(telegram, message_id, &text, timeout)
+        telegram_edit_message_text(
+            telegram,
+            message_id,
+            &settled_question_text(original, outcome),
+            timeout,
+        )
     });
     if !matches!(edited, Some(Ok(_))) {
         let _ = telegram_remove_inline_keyboard(telegram, message_id, timeout);
     }
+}
+
+/// The question message with its outcome appended, within Telegram's text limit: the outcome,
+/// which can carry a long free-text answer, gets at most half of it and the original the rest.
+fn settled_question_text(original: &str, outcome: &str) -> String {
+    let outcome = truncate_to_char_limit(outcome, TELEGRAM_MESSAGE_CHAR_LIMIT / 2);
+    let budget = TELEGRAM_MESSAGE_CHAR_LIMIT.saturating_sub(outcome.chars().count() + 2);
+    let original = truncate_to_char_limit(original.trim_end(), budget);
+    format!("{original}\n\n{outcome}")
 }
 
 fn question_outcome_text(
@@ -1837,7 +1843,7 @@ pub(crate) fn process_telegram_updates(
 /// Telegram lets a bot delete a message for 48 hours; stop retrying a little before that.
 const TELEGRAM_DELETE_WINDOW_MS: u64 = 47 * 60 * 60 * 1000;
 const TELEGRAM_SECRET_NOT_DELETED_TEXT: &str =
-    "⚠️ The bridge could not delete your secret answer to Codex from this chat. Please delete it yourself.";
+    "⚠️ The bridge could not delete one of your secret answers to Codex. Please delete it yourself.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageDeletionStep {
@@ -1871,21 +1877,23 @@ fn retry_pending_message_deletions(
     now: u64,
     timeout: Duration,
 ) -> Result<()> {
+    let bot_id = telegram_bot_id(&telegram.bot_token);
     for deletion in due_telegram_message_deletions(conn, now)? {
-        if deletion.chat_id != telegram.chat_id {
-            // The bot was reconfigured for another chat and can no longer reach this one.
-            finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
-            continue;
-        }
-        let error = telegram_delete_message(telegram, deletion.message_id, timeout)
-            .err()
-            .map(|error| format!("{error:#}"));
+        // Deleting in the stored chat still works after the bridge is re-paired with another
+        // chat; only a different bot can no longer remove the message.
+        let error = if deletion.bot_id == bot_id {
+            telegram_delete_message(telegram, &deletion.chat_id, deletion.message_id, timeout)
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            Some("message can't be deleted: the bridge now uses a different bot".to_string())
+        };
         match message_deletion_step(error.as_deref(), deletion.created_at, now) {
             MessageDeletionStep::Done => {
-                finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
+                finish_telegram_message_deletion(conn, &deletion)?;
             }
             MessageDeletionStep::GiveUp => {
-                finish_telegram_message_deletion(conn, &deletion.chat_id, deletion.message_id)?;
+                finish_telegram_message_deletion(conn, &deletion)?;
                 let _ = telegram_send_text(telegram, TELEGRAM_SECRET_NOT_DELETED_TEXT, timeout);
             }
             MessageDeletionStep::Retry => {
@@ -1953,6 +1961,7 @@ fn process_telegram_update_batch(
                         if let Some(message_id) = route.message_id {
                             queue_telegram_message_deletion(
                                 conn,
+                                bot_id,
                                 &telegram.chat_id,
                                 message_id,
                                 now,
@@ -3295,6 +3304,24 @@ mod tests {
             "a late reply to a settled secret question must still be deleted"
         );
         assert!(!question_is_secret(&conn, "question_unknown", "token").expect("unknown"));
+    }
+
+    #[test]
+    fn a_long_answer_still_fits_into_the_settled_question_message() {
+        let original = "❓ Codex has a question\n".to_string() + &"question ".repeat(400);
+        let answer = "a very long free-text answer ".repeat(300);
+        let outcome = question_outcome_text(Some(&answer), false, true, 0);
+        assert!(original.chars().count() < 3900 && outcome.chars().count() > 4096);
+
+        let text = settled_question_text(&original, &outcome);
+
+        assert!(text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT);
+        assert!(text.starts_with("❓ Codex has a question\nquestion"));
+        assert!(text.contains("\n\n✅ Answer: a very long free-text answer"));
+        assert!(text.ends_with('…'));
+
+        let short = settled_question_text("Q?", "✅ Answer: Blue\n📤 Sent to Codex.");
+        assert_eq!(short, "Q?\n\n✅ Answer: Blue\n📤 Sent to Codex.");
     }
 
     #[test]
