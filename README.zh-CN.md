@@ -161,6 +161,8 @@ URL 必须与 `codex.websocketUrl` 一致，受管 App Server 也必须使用目
 
 原生审批通知提供“允许一次”“本会话允许”和“拒绝”三个按钮。每个按钮只绑定一个未决 App Server 请求；如果另一个客户端先作答，或 turn 已结束，后续点击会安全地显示为已过期。
 
+Codex 在 Plan 模式下提出的问题会按每题一条 Telegram 消息推送，附带选项按钮和 `Skip`，允许自由回答时可用 Telegram 的 Reply 直接作答。详见 [docs/telegram.md](docs/telegram.md#codex-questions)。
+
 如果回复无法到达 Codex，请在 Telegram 中发送 `/repair`。它会在配置的 websocket URL 上重启共享本地后端并保持远程模式开启。
 
 Telegram 创建的线程在显式注册的项目工作目录中运行。用 Telegram 的 `/project <id>` 设置当前项目，用 `/project` 查看选项，或用 `codex-telegram-bridge projects ...` 在本地管理注册表。

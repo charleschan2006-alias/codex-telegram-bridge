@@ -8,9 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codex::{
-    app_server_approval_response, app_server_request_matches_approval, normalized_message,
-    set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
-    CodexAppServerClient,
+    app_server_approval_response, app_server_question_answers_complete,
+    app_server_question_response, app_server_questions, app_server_request_matches_approval,
+    normalized_message, set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
+    CodexAppServerClient, CodexAppServerTransportInfo,
 };
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
@@ -18,13 +19,14 @@ use crate::state::{
     delete_setting, expire_app_server_approval, get_setting_number,
     get_telegram_current_project_id, insert_telegram_callback_route, insert_telegram_command_route,
     insert_telegram_message_route, list_recent_thread_snapshots_from_db,
-    lookup_pending_app_server_approval, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_app_server_approval_responded,
-    mark_telegram_callback_route_used, mark_telegram_command_route_used,
-    observed_workspaces_from_db, record_action, record_telegram_inbound_processed, set_setting,
+    lookup_pending_app_server_approval, lookup_question_message_route,
+    lookup_telegram_command_route, lookup_telegram_message_route,
+    mark_app_server_approval_responded, mark_telegram_callback_route_used,
+    mark_telegram_command_route_used, observed_workspaces_from_db, pending_question_answers,
+    record_action, record_pending_question_answer, record_telegram_inbound_processed, set_setting,
     set_setting_text, set_telegram_current_project_id, telegram_inbound_processed,
-    update_telegram_callback_message_id, BridgeThreadSnapshot, TelegramCallbackAction,
-    TelegramCommandRouteKind, TelegramInboundLogContext,
+    update_telegram_callback_message_id, AppServerApprovalRequest, BridgeThreadSnapshot,
+    TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::ws::validate_shared_websocket_url;
 use crate::{
@@ -36,9 +38,10 @@ use crate::{
 
 use self::api::{
     telegram_answer_callback_query, telegram_bot_commands, telegram_chat_id,
-    telegram_delete_webhook, telegram_from_user_id, telegram_get_updates, telegram_message_id,
-    telegram_send_chat_action, telegram_send_message, telegram_send_text,
-    telegram_send_text_message_id, telegram_updates_array,
+    telegram_delete_message, telegram_delete_webhook, telegram_edit_message_text,
+    telegram_from_user_id, telegram_get_updates, telegram_message_id,
+    telegram_remove_inline_keyboard, telegram_send_chat_action, telegram_send_message,
+    telegram_send_text, telegram_send_text_message_id, telegram_updates_array,
 };
 use self::render::{
     prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
@@ -87,6 +90,19 @@ pub(crate) struct RoutedTelegramCallback {
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
     pub(crate) approval_key: Option<String>,
+    pub(crate) question_id: Option<String>,
+    pub(crate) answer: Option<String>,
+}
+
+/// A Telegram Reply to a question message: a free-form answer to that one question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoutedTelegramQuestionReply {
+    pub(crate) question_key: String,
+    pub(crate) question_id: String,
+    pub(crate) text: String,
+    pub(crate) message_id: Option<i64>,
+    pub(crate) question_message_id: i64,
+    pub(crate) question_message_text: Option<String>,
 }
 
 pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
@@ -481,7 +497,8 @@ pub(crate) fn extract_telegram_callback_route(
     let message_id = message.and_then(telegram_message_id);
     let route = conn
         .query_row(
-            "SELECT thread_id, action, approval_key FROM telegram_callback_routes
+            "SELECT thread_id, action, approval_key, question_id, answer
+             FROM telegram_callback_routes
              WHERE callback_id = ?1 AND chat_id = ?2 AND used_at IS NULL
                AND (message_id IS NULL OR message_id = ?3)",
             params![callback_id, chat_id, message_id],
@@ -490,18 +507,69 @@ pub(crate) fn extract_telegram_callback_route(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    Ok(route.and_then(|(thread_id, action, approval_key)| {
-        TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
-            callback_query_id: callback_query_id.to_string(),
-            callback_id: callback_id.to_string(),
-            thread_id,
-            action,
-            approval_key,
-        })
+    Ok(
+        route.and_then(|(thread_id, action, approval_key, question_id, answer)| {
+            TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
+                callback_query_id: callback_query_id.to_string(),
+                callback_id: callback_id.to_string(),
+                thread_id,
+                action,
+                approval_key,
+                question_id,
+                answer,
+            })
+        }),
+    )
+}
+
+pub(crate) fn extract_telegram_question_reply(
+    conn: &Connection,
+    message: &Value,
+    telegram: &TelegramConfig,
+) -> Result<Option<RoutedTelegramQuestionReply>> {
+    let chat_id = telegram_chat_id(message);
+    let user_id = telegram_from_user_id(message);
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    let Some(chat_id) = chat_id else {
+        return Ok(None);
+    };
+    let Some(reply_to) = message.get("reply_to_message") else {
+        return Ok(None);
+    };
+    let Some(question_message_id) = telegram_message_id(reply_to) else {
+        return Ok(None);
+    };
+    let Some(text) = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some((question_key, question_id)) =
+        lookup_question_message_route(conn, &chat_id, question_message_id)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RoutedTelegramQuestionReply {
+        question_key,
+        question_id,
+        text: text.to_string(),
+        message_id: telegram_message_id(message),
+        question_message_id,
+        question_message_text: reply_to
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }))
 }
 
@@ -755,17 +823,17 @@ fn send_codex_reply_to_thread(
     }))
 }
 
-fn send_native_codex_approval(
+/// Answers a pending App Server request from a fresh connection: resuming the thread makes
+/// the App Server replay its pending requests to this connection, which can then respond.
+/// Returns None, and expires the request, when Codex no longer has it pending.
+fn respond_to_replayed_server_request(
     conn: &Connection,
     config: &DaemonConfig,
-    approval_key: &str,
-    action: TelegramCallbackAction,
+    request: &AppServerApprovalRequest,
+    response: Value,
     now: u64,
     deadline: Option<Instant>,
-) -> Result<Option<Value>> {
-    let Some(request) = lookup_pending_app_server_approval(conn, approval_key)? else {
-        return Ok(None);
-    };
+) -> Result<Option<(Value, CodexAppServerTransportInfo)>> {
     let mut client = CodexAppServerClient::connect_configured(config)?;
     if let Some(deadline) = deadline {
         client.set_deadline(deadline);
@@ -779,22 +847,226 @@ fn send_native_codex_approval(
                 || message.contains("thread not loaded")
                 || message.contains("thread not found")
             {
-                expire_app_server_approval(conn, approval_key, now)?;
+                expire_app_server_approval(conn, &request.approval_key, now)?;
                 return Ok(None);
             }
             return Err(error);
         }
     };
     let replayed = client.wait_for_server_request(Duration::from_secs(2), |message| {
-        app_server_request_matches_approval(message, &request)
+        app_server_request_matches_approval(message, request)
     })?;
     if replayed.is_none() {
-        expire_app_server_approval(conn, approval_key, now)?;
+        expire_app_server_approval(conn, &request.approval_key, now)?;
         return Ok(None);
     }
+    client.respond_to_server_request(&request.request_id, response)?;
+    Ok(Some((resumed, transport)))
+}
 
+#[derive(Debug)]
+enum QuestionAnswerOutcome {
+    /// The question is answered, expired, or was never pending: nothing was recorded.
+    NotPending,
+    /// Codex asked for one of the options only, and this was a free-form reply.
+    NeedsOption,
+    Recorded {
+        result: Value,
+        /// All questions of the request are settled and the answers went to Codex.
+        sent: bool,
+        remaining: usize,
+        is_secret: bool,
+    },
+}
+
+/// Records one question's answer (`None` skips it). Answers are held until every question of
+/// the request is answered or skipped, then sent to Codex together, as the protocol requires.
+#[allow(clippy::too_many_arguments)]
+fn answer_codex_question(
+    conn: &Connection,
+    config: &DaemonConfig,
+    question_key: &str,
+    question_id: &str,
+    answer: Option<&str>,
+    free_text: bool,
+    now: u64,
+    deadline: Option<Instant>,
+) -> Result<QuestionAnswerOutcome> {
+    let Some(request) = lookup_pending_app_server_approval(conn, question_key)? else {
+        return Ok(QuestionAnswerOutcome::NotPending);
+    };
+    let questions = app_server_questions(&request);
+    let Some(question) = questions.iter().find(|question| question.id == question_id) else {
+        return Ok(QuestionAnswerOutcome::NotPending);
+    };
+    if free_text && !question.accepts_free_text() {
+        return Ok(QuestionAnswerOutcome::NeedsOption);
+    }
+    let mut answers = pending_question_answers(conn, question_key)?;
+    if answers.contains_key(question_id) {
+        return Ok(QuestionAnswerOutcome::NotPending);
+    }
+    answers.insert(
+        question_id.to_string(),
+        answer.map_or(Value::Null, |answer| json!(answer)),
+    );
+    let remaining = questions
+        .iter()
+        .filter(|question| !answers.contains_key(&question.id))
+        .count();
+    let summary = json!({
+        "questionKey": question_key,
+        "questionId": question_id,
+        "skipped": answer.is_none(),
+        "freeText": free_text,
+        "remaining": remaining,
+    });
+
+    if !app_server_question_answers_complete(&request, &answers) {
+        if !record_pending_question_answer(conn, question_key, question_id, answer, now)? {
+            return Ok(QuestionAnswerOutcome::NotPending);
+        }
+        return Ok(QuestionAnswerOutcome::Recorded {
+            result: json!({
+                "ok": true,
+                "action": "telegram_question_answer_saved",
+                "threadId": request.thread_id,
+                "question": summary,
+                "sentAt": now,
+            }),
+            sent: false,
+            remaining,
+            is_secret: question.is_secret,
+        });
+    }
+
+    // Send before persisting the final answer, so a failed send can be retried with a tap.
+    let response = app_server_question_response(&request, &answers);
+    let Some((resumed, transport)) =
+        respond_to_replayed_server_request(conn, config, &request, response, now, deadline)?
+    else {
+        return Ok(QuestionAnswerOutcome::NotPending);
+    };
+    record_pending_question_answer(conn, question_key, question_id, answer, now)?;
+    mark_app_server_approval_responded(conn, question_key, now)?;
+    // Answer text stays out of the logs: Codex may mark a question as secret.
+    record_action(
+        conn,
+        &request.thread_id,
+        "telegram_app_server_question",
+        json!({
+            "questionKey": question_key,
+            "requestId": request.request_id,
+            "turnId": request.turn_id,
+            "itemId": request.item_id,
+            "answered": answers
+                .iter()
+                .filter(|(_, answer)| !answer.is_null())
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            "skipped": answers
+                .iter()
+                .filter(|(_, answer)| answer.is_null())
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            "resumed": resumed,
+            "sentAt": now,
+        }),
+        now,
+    )?;
+    if let Some(telegram) = config.telegram.as_ref() {
+        register_telegram_typing_indicator(conn, telegram, &request.thread_id, now)?;
+    }
+    Ok(QuestionAnswerOutcome::Recorded {
+        result: json!({
+            "ok": true,
+            "action": "telegram_app_server_question",
+            "threadId": request.thread_id,
+            "turnId": request.turn_id,
+            "itemId": request.item_id,
+            "question": summary,
+            "codex": {
+                "transport": transport.transport,
+                "appServerPid": transport.app_server_pid,
+            },
+            "sentAt": now,
+        }),
+        sent: true,
+        remaining,
+        is_secret: question.is_secret,
+    })
+}
+
+/// Shows the outcome on the question message and removes its buttons. Best effort: the answer
+/// already reached the bridge, so a failed edit must not fail the update.
+fn settle_question_message(
+    telegram: &TelegramConfig,
+    message_id: Option<i64>,
+    original_text: Option<&str>,
+    outcome: &str,
+    timeout: Duration,
+) {
+    let Some(message_id) = message_id else {
+        return;
+    };
+    let edited = original_text.map(|original| {
+        let text = format!("{}\n\n{outcome}", original.trim_end());
+        let text = if text.chars().count() > 4096 {
+            format!(
+                "{}\n\n{outcome}",
+                original.chars().take(3900).collect::<String>().trim_end()
+            )
+        } else {
+            text
+        };
+        telegram_edit_message_text(telegram, message_id, &text, timeout)
+    });
+    if !matches!(edited, Some(Ok(_))) {
+        let _ = telegram_remove_inline_keyboard(telegram, message_id, timeout);
+    }
+}
+
+fn question_outcome_text(
+    answer: Option<&str>,
+    is_secret: bool,
+    sent: bool,
+    remaining: usize,
+) -> String {
+    let answered = match answer {
+        None => "⏭ Skipped".to_string(),
+        Some(_) if is_secret => "✅ Answered (hidden)".to_string(),
+        Some(answer) => format!("✅ Answer: {answer}"),
+    };
+    if sent {
+        format!("{answered}\n📤 Sent to Codex.")
+    } else {
+        format!("{answered}\n💾 Saved. Codex gets it once the other {remaining} question(s) are settled.")
+    }
+}
+
+fn send_native_codex_approval(
+    conn: &Connection,
+    config: &DaemonConfig,
+    approval_key: &str,
+    action: TelegramCallbackAction,
+    now: u64,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>> {
+    let Some(request) = lookup_pending_app_server_approval(conn, approval_key)? else {
+        return Ok(None);
+    };
     let response = app_server_approval_response(&request, action)?;
-    client.respond_to_server_request(&request.request_id, response.clone())?;
+    let Some((resumed, transport)) = respond_to_replayed_server_request(
+        conn,
+        config,
+        &request,
+        response.clone(),
+        now,
+        deadline,
+    )?
+    else {
+        return Ok(None);
+    };
     mark_app_server_approval_responded(conn, approval_key, now)?;
     record_action(
         conn,
@@ -843,6 +1115,9 @@ fn send_legacy_codex_approval_to_thread(
     let sent_text = match action {
         TelegramCallbackAction::Approve | TelegramCallbackAction::ApproveForSession => "YES",
         TelegramCallbackAction::Deny => "NO",
+        TelegramCallbackAction::AnswerOption | TelegramCallbackAction::SkipQuestion => {
+            bail!("question buttons need a pending Codex question request")
+        }
     };
     let mut client = CodexAppServerClient::connect_configured(config)?;
     if let Some(deadline) = deadline {
@@ -1587,7 +1862,87 @@ fn process_telegram_update_batch(
                 let route_message_id = message
                     .get("reply_to_message")
                     .and_then(telegram_message_id);
-                if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
+                // Replies to a question message answer that question and are never sent to
+                // Codex as a new turn, even once the question is settled.
+                if let Some(route) = extract_telegram_question_reply(conn, message, telegram)? {
+                    let outcome = answer_codex_question(
+                        conn,
+                        config,
+                        &route.question_key,
+                        &route.question_id,
+                        Some(&route.text),
+                        true,
+                        now,
+                        deadline,
+                    )?;
+                    let (update_kind, result) = match outcome {
+                        QuestionAnswerOutcome::Recorded {
+                            result,
+                            sent,
+                            remaining,
+                            is_secret,
+                        } => {
+                            if is_secret {
+                                if let Some(message_id) = route.message_id {
+                                    let _ = telegram_delete_message(telegram, message_id, timeout);
+                                }
+                            }
+                            settle_question_message(
+                                telegram,
+                                Some(route.question_message_id),
+                                route.question_message_text.as_deref(),
+                                &question_outcome_text(
+                                    Some(&route.text),
+                                    is_secret,
+                                    sent,
+                                    remaining,
+                                ),
+                                timeout,
+                            );
+                            replies += 1;
+                            ("telegram_question_reply", result)
+                        }
+                        QuestionAnswerOutcome::NotPending => {
+                            let _ = telegram_send_text(
+                                telegram,
+                                "This question is no longer waiting for an answer, so your reply was not sent to Codex.",
+                                timeout,
+                            );
+                            ignored += 1;
+                            (
+                                "telegram_question_reply_expired",
+                                json!({ "ok": true, "ignored": true }),
+                            )
+                        }
+                        QuestionAnswerOutcome::NeedsOption => {
+                            let _ = telegram_send_text(
+                                telegram,
+                                "Codex asked you to pick one of the options: tap a button on the question, or Skip.",
+                                timeout,
+                            );
+                            ignored += 1;
+                            (
+                                "telegram_question_reply_needs_option",
+                                json!({ "ok": true, "ignored": true }),
+                            )
+                        }
+                    };
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            bot_id,
+                            update_id,
+                            update_kind,
+                            &result,
+                            TelegramInboundLogContext {
+                                route_message_id,
+                                result_action: result.get("action").and_then(Value::as_str),
+                                ..TelegramInboundLogContext::default()
+                            },
+                            now,
+                        )?;
+                    }
+                } else if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
                     let result = send_codex_reply_to_thread(
                         conn,
                         config,
@@ -1691,7 +2046,109 @@ fn process_telegram_update_batch(
                     .get("message")
                     .and_then(|message| message.get("message_id"))
                     .and_then(Value::as_i64);
+                let callback_message_text = callback_query
+                    .pointer("/message/text")
+                    .and_then(Value::as_str);
                 match extract_telegram_callback_route(conn, callback_query, telegram)? {
+                    Some(route) if route.action.answers_question() => {
+                        let outcome =
+                            match (route.approval_key.as_deref(), route.question_id.as_deref()) {
+                                (Some(question_key), Some(question_id)) => {
+                                    match answer_codex_question(
+                                        conn,
+                                        config,
+                                        question_key,
+                                        question_id,
+                                        route.answer.as_deref(),
+                                        false,
+                                        now,
+                                        deadline,
+                                    ) {
+                                        Ok(outcome) => outcome,
+                                        Err(error) => {
+                                            let _ = telegram_answer_callback_query(
+                                            telegram,
+                                            &route.callback_query_id,
+                                            "Codex is temporarily unavailable; tap again to retry",
+                                            timeout,
+                                        );
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                                _ => QuestionAnswerOutcome::NotPending,
+                            };
+                        mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                        let (update_kind, result, toast) = match outcome {
+                            QuestionAnswerOutcome::Recorded {
+                                result,
+                                sent,
+                                remaining,
+                                is_secret,
+                            } => {
+                                settle_question_message(
+                                    telegram,
+                                    route_message_id,
+                                    callback_message_text,
+                                    &question_outcome_text(
+                                        route.answer.as_deref(),
+                                        is_secret,
+                                        sent,
+                                        remaining,
+                                    ),
+                                    timeout,
+                                );
+                                callbacks += 1;
+                                let toast = if sent {
+                                    "Sent to Codex".to_string()
+                                } else {
+                                    format!("Saved: {remaining} more question(s) to go")
+                                };
+                                ("callback_query", result, toast)
+                            }
+                            QuestionAnswerOutcome::NotPending
+                            | QuestionAnswerOutcome::NeedsOption => {
+                                if let Some(message_id) = route_message_id {
+                                    let _ = telegram_remove_inline_keyboard(
+                                        telegram, message_id, timeout,
+                                    );
+                                }
+                                ignored += 1;
+                                (
+                                    "callback_query_expired",
+                                    json!({
+                                        "ok": true,
+                                        "action": "telegram_question_expired",
+                                        "threadId": route.thread_id,
+                                        "ignored": true,
+                                    }),
+                                    "This question is no longer pending".to_string(),
+                                )
+                            }
+                        };
+                        if let Some(update_id) = update_id {
+                            record_telegram_inbound_processed(
+                                conn,
+                                bot_id,
+                                update_id,
+                                update_kind,
+                                &result,
+                                TelegramInboundLogContext {
+                                    thread_id: Some(&route.thread_id),
+                                    route_message_id,
+                                    result_action: result.get("action").and_then(Value::as_str),
+                                    ..TelegramInboundLogContext::default()
+                                },
+                                now,
+                            )?;
+                        }
+                        let _ = telegram_answer_callback_query(
+                            telegram,
+                            &route.callback_query_id,
+                            &toast,
+                            timeout,
+                        );
+                    }
                     Some(route) => {
                         let dispatched = if let Some(approval_key) = route.approval_key.as_deref() {
                             match send_native_codex_approval(
@@ -1773,10 +2230,15 @@ fn process_telegram_update_batch(
                                         now,
                                     )?;
                                 }
+                                if let Some(message_id) = route_message_id {
+                                    let _ = telegram_remove_inline_keyboard(
+                                        telegram, message_id, timeout,
+                                    );
+                                }
                                 let _ = telegram_answer_callback_query(
                                     telegram,
                                     &route.callback_query_id,
-                                    "This approval is no longer pending",
+                                    "This request is no longer pending",
                                     timeout,
                                 );
                                 ignored += 1;
@@ -1790,9 +2252,25 @@ fn process_telegram_update_batch(
                             let _ = telegram_answer_callback_query(
                                 telegram,
                                 callback_query_id,
-                                "This approval is no longer pending",
+                                "This request is no longer pending",
                                 timeout,
                             );
+                        }
+                        // Retire the dead buttons, but only on the authorized chat's own message.
+                        let callback_chat_id =
+                            callback_query.get("message").and_then(telegram_chat_id);
+                        let callback_user_id = callback_query
+                            .pointer("/from/id")
+                            .and_then(Value::as_i64)
+                            .map(|id| id.to_string());
+                        if let Some(message_id) = route_message_id.filter(|_| {
+                            telegram_authorized(
+                                telegram,
+                                callback_chat_id.as_deref(),
+                                callback_user_id.as_deref(),
+                            )
+                        }) {
+                            let _ = telegram_remove_inline_keyboard(telegram, message_id, timeout);
                         }
                         if let Some(update_id) = update_id {
                             record_telegram_inbound_processed(
@@ -2405,6 +2883,275 @@ mod tests {
         assert!(response.get("method").is_none());
     }
 
+    fn question_test_config(websocket_url: &str) -> DaemonConfig {
+        DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: websocket_url.to_string(),
+                codex_home: None,
+            }),
+            projects: Vec::new(),
+        }
+    }
+
+    fn store_question_request(conn: &Connection, server_request: &Value) -> String {
+        let request = crate::codex::parse_app_server_approval_request(server_request)
+            .expect("parse question")
+            .expect("question request");
+        crate::state::upsert_app_server_approval_request(conn, &request, 1000)
+            .expect("store question");
+        request.approval_key
+    }
+
+    #[test]
+    fn telegram_question_answers_are_held_until_every_question_is_settled() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let server_request = json!({
+            "id": 7,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "call_1",
+                "isBlocking": true,
+                "autoResolutionMs": null,
+                "questions": [
+                    {
+                        "id": "color", "header": "Color", "question": "Which color?",
+                        "isOther": true, "isSecret": false,
+                        "options": [
+                            { "label": "Red", "description": "Warm" },
+                            { "label": "Blue", "description": "Cool" }
+                        ]
+                    },
+                    {
+                        "id": "size", "header": "Size", "question": "Which size?",
+                        "isOther": true, "isSecret": false,
+                        "options": [{ "label": "Small", "description": "" }]
+                    }
+                ]
+            }
+        });
+        let key = store_question_request(&conn, &server_request);
+        assert!(key.starts_with("question_"));
+        let server = FakeCodexWsServer::spawn_approval_replay(server_request);
+        let config = question_test_config(&server.url);
+
+        // The first answer is only saved: Codex takes all answers in one response.
+        match answer_codex_question(
+            &conn,
+            &config,
+            &key,
+            "color",
+            Some("Blue"),
+            false,
+            1100,
+            None,
+        )
+        .expect("first answer")
+        {
+            QuestionAnswerOutcome::Recorded {
+                sent, remaining, ..
+            } => {
+                assert!(!sent);
+                assert_eq!(remaining, 1);
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        // A second tap on the same question can never overwrite the first answer.
+        assert!(matches!(
+            answer_codex_question(
+                &conn,
+                &config,
+                &key,
+                "color",
+                Some("Red"),
+                false,
+                1101,
+                None
+            )
+            .expect("repeat answer"),
+            QuestionAnswerOutcome::NotPending
+        ));
+
+        // The last open question sends everything, including a free-form "Other" answer.
+        match answer_codex_question(
+            &conn,
+            &config,
+            &key,
+            "size",
+            Some("Medium, between the two"),
+            true,
+            1102,
+            None,
+        )
+        .expect("last answer")
+        {
+            QuestionAnswerOutcome::Recorded { sent, result, .. } => {
+                assert!(sent);
+                assert_eq!(result["action"], "telegram_app_server_question");
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        assert!(lookup_pending_app_server_approval(&conn, &key)
+            .expect("lookup after response")
+            .is_none());
+        assert!(pending_question_answers(&conn, &key)
+            .expect("answers after response")
+            .is_empty());
+        assert!(matches!(
+            answer_codex_question(&conn, &config, &key, "size", None, false, 1103, None)
+                .expect("late skip"),
+            QuestionAnswerOutcome::NotPending
+        ));
+
+        let messages = server.finish();
+        let response = messages.last().expect("question response");
+        assert_eq!(response["id"], 7);
+        assert_eq!(
+            response["result"],
+            json!({
+                "answers": {
+                    "color": { "answers": ["Blue"] },
+                    "size": { "answers": ["Medium, between the two"] }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn telegram_question_skip_sends_no_answer_and_option_only_questions_refuse_free_text() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let server_request = json!({
+            "id": "req-8",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "call_2",
+                "isBlocking": true,
+                "questions": [{
+                    "id": "plan", "header": "Plan", "question": "Which plan?",
+                    "isOther": false, "isSecret": false,
+                    "options": [
+                        { "label": "Fast (Recommended)", "description": "Ship today" },
+                        { "label": "Thorough", "description": "Ship next week" }
+                    ]
+                }]
+            }
+        });
+        let key = store_question_request(&conn, &server_request);
+        let server = FakeCodexWsServer::spawn_approval_replay(server_request);
+        let config = question_test_config(&server.url);
+
+        assert!(matches!(
+            answer_codex_question(
+                &conn,
+                &config,
+                &key,
+                "plan",
+                Some("whatever"),
+                true,
+                1100,
+                None
+            )
+            .expect("free text"),
+            QuestionAnswerOutcome::NeedsOption
+        ));
+        match answer_codex_question(&conn, &config, &key, "plan", None, false, 1101, None)
+            .expect("skip")
+        {
+            QuestionAnswerOutcome::Recorded { sent, .. } => assert!(sent),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        let messages = server.finish();
+        let response = messages.last().expect("question response");
+        assert_eq!(response["id"], "req-8");
+        assert_eq!(response["result"], json!({ "answers": {} }));
+    }
+
+    #[test]
+    fn a_reply_to_a_question_message_is_a_question_answer_not_a_new_turn() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        };
+        insert_telegram_message_route(&conn, "456", 50, "thr_1", "event_1", 1000)
+            .expect("message route");
+        insert_telegram_callback_route(
+            &conn,
+            &crate::state::TelegramCallbackRoute {
+                callback_id: "cb_q".to_string(),
+                chat_id: "456".to_string(),
+                message_id: Some(50),
+                thread_id: "thr_1".to_string(),
+                action: TelegramCallbackAction::SkipQuestion,
+                approval_key: Some("question_1".to_string()),
+                question_id: Some("color".to_string()),
+                answer: None,
+            },
+            1000,
+        )
+        .expect("question route");
+        let reply = json!({
+            "message_id": 51,
+            "chat": { "id": 456 },
+            "from": { "id": 789 },
+            "text": "  Teal, please ",
+            "reply_to_message": { "message_id": 50, "text": "❓ Codex has a question" }
+        });
+
+        let routed = extract_telegram_question_reply(&conn, &reply, &telegram)
+            .expect("extract")
+            .expect("question reply");
+        assert_eq!(routed.question_key, "question_1");
+        assert_eq!(routed.question_id, "color");
+        assert_eq!(routed.text, "Teal, please");
+        assert_eq!(routed.message_id, Some(51));
+        assert_eq!(routed.question_message_id, 50);
+        assert_eq!(
+            routed.question_message_text.as_deref(),
+            Some("❓ Codex has a question")
+        );
+
+        // A settled question is still recognised, so its late replies are refused rather
+        // than falling through to the ordinary reply route and starting a turn.
+        mark_telegram_callback_route_used(&conn, "cb_q", 1001).expect("use route");
+        assert!(extract_telegram_question_reply(&conn, &reply, &telegram)
+            .expect("extract settled")
+            .is_some());
+
+        let stranger = json!({
+            "message_id": 52,
+            "chat": { "id": 456 },
+            "from": { "id": 999 },
+            "text": "Red",
+            "reply_to_message": { "message_id": 50 }
+        });
+        assert!(extract_telegram_question_reply(&conn, &stranger, &telegram)
+            .expect("extract unauthorized")
+            .is_none());
+    }
+
+    #[test]
+    fn question_outcome_text_hides_secret_answers() {
+        assert_eq!(
+            question_outcome_text(Some("Blue"), false, true, 0),
+            "✅ Answer: Blue\n📤 Sent to Codex."
+        );
+        assert_eq!(
+            question_outcome_text(Some("hunter2"), true, false, 1),
+            "✅ Answered (hidden)\n💾 Saved. Codex gets it once the other 1 question(s) are settled."
+        );
+        assert!(question_outcome_text(None, false, true, 0).starts_with("⏭ Skipped"));
+    }
+
     #[test]
     fn remote_commands_start_stop_and_repair_shared_backend() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
@@ -2758,6 +3505,8 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 action: TelegramCallbackAction::Approve,
                 approval_key: None,
+                question_id: None,
+                answer: None,
             },
             1000,
         )

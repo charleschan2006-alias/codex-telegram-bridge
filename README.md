@@ -161,6 +161,8 @@ The URL must match `codex.websocketUrl`, and the configured App Server must use 
 
 Native approval notifications offer `Allow once`, `Allow session`, and `Deny`. Each button is bound to one pending App Server request. If another client answers first, or the turn ends, later taps are rejected as expired.
 
+Questions Codex asks in Plan mode arrive as one Telegram message per question, with option buttons, `Skip`, and Telegram Reply for free-form answers. See [docs/telegram.md](docs/telegram.md#codex-questions).
+
 If replies stop reaching Codex, send `/repair` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps remote mode on.
 
 Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/project`, or manage the registry locally with `codex-telegram-bridge projects ...`.

@@ -171,6 +171,11 @@ pub(crate) struct TelegramCallbackRoute {
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
     pub(crate) approval_key: Option<String>,
+    /// For question buttons: the `item/tool/requestUserInput` question this button answers.
+    pub(crate) question_id: Option<String>,
+    /// For option buttons: the option label sent to Codex. Kept server-side, so labels never
+    /// have to fit into Telegram's 64-byte callback_data.
+    pub(crate) answer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +183,8 @@ pub(crate) enum TelegramCallbackAction {
     Approve,
     ApproveForSession,
     Deny,
+    AnswerOption,
+    SkipQuestion,
 }
 
 impl TelegramCallbackAction {
@@ -186,6 +193,8 @@ impl TelegramCallbackAction {
             Self::Approve => "approve",
             Self::ApproveForSession => "approve_for_session",
             Self::Deny => "deny",
+            Self::AnswerOption => "answer_option",
+            Self::SkipQuestion => "skip_question",
         }
     }
 
@@ -194,8 +203,14 @@ impl TelegramCallbackAction {
             "approve" => Some(Self::Approve),
             "approve_for_session" => Some(Self::ApproveForSession),
             "deny" => Some(Self::Deny),
+            "answer_option" => Some(Self::AnswerOption),
+            "skip_question" => Some(Self::SkipQuestion),
             _ => None,
         }
+    }
+
+    pub(crate) fn answers_question(self) -> bool {
+        matches!(self, Self::AnswerOption | Self::SkipQuestion)
     }
 }
 
@@ -607,6 +622,9 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_key", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
+    ensure_column(conn, "app_server_approval_requests", "answers_json", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
@@ -1599,14 +1617,17 @@ pub(crate) fn insert_telegram_callback_route(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO telegram_callback_routes(
-            callback_id, chat_id, message_id, thread_id, action, approval_key, created_at, used_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+            callback_id, chat_id, message_id, thread_id, action, approval_key,
+            question_id, answer, created_at, used_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
          ON CONFLICT(callback_id) DO UPDATE SET
             chat_id = excluded.chat_id,
             message_id = COALESCE(excluded.message_id, telegram_callback_routes.message_id),
             thread_id = excluded.thread_id,
             action = excluded.action,
-            approval_key = excluded.approval_key",
+            approval_key = excluded.approval_key,
+            question_id = excluded.question_id,
+            answer = excluded.answer",
         params![
             route.callback_id,
             route.chat_id,
@@ -1614,6 +1635,8 @@ pub(crate) fn insert_telegram_callback_route(
             route.thread_id,
             route.action.as_str(),
             route.approval_key,
+            route.question_id,
+            route.answer,
             to_sql_i64(now)?,
         ],
     )?;
@@ -1704,7 +1727,7 @@ pub(crate) fn mark_app_server_approval_responded(
     let now = to_sql_i64(now)?;
     let changed = conn.execute(
         "UPDATE app_server_approval_requests
-         SET status = 'responded', responded_at = ?2
+         SET status = 'responded', responded_at = ?2, answers_json = NULL
          WHERE approval_key = ?1 AND status = 'pending'",
         params![approval_key, now],
     )?;
@@ -1727,7 +1750,7 @@ pub(crate) fn expire_app_server_approval(
     let now = to_sql_i64(now)?;
     conn.execute(
         "UPDATE app_server_approval_requests
-         SET status = 'expired', resolved_at = ?2
+         SET status = 'expired', resolved_at = ?2, answers_json = NULL
          WHERE approval_key = ?1 AND status = 'pending'",
         params![approval_key, now],
     )?;
@@ -1760,12 +1783,118 @@ pub(crate) fn resolve_app_server_approval_request(
     )?;
     let changed = conn.execute(
         "UPDATE app_server_approval_requests
-         SET status = 'resolved', resolved_at = ?3
+         SET status = 'resolved', resolved_at = ?3, answers_json = NULL
          WHERE thread_id = ?1 AND request_id_json = ?2
            AND status IN ('pending', 'responded')",
         params![thread_id, request_id_json, now],
     )?;
     Ok(changed)
+}
+
+fn parse_question_answers(raw: Option<String>) -> Result<serde_json::Map<String, Value>> {
+    let Some(raw) = raw else {
+        return Ok(serde_json::Map::new());
+    };
+    serde_json::from_str::<Value>(&raw)
+        .context("invalid stored question answers")?
+        .as_object()
+        .cloned()
+        .context("stored question answers are not an object")
+}
+
+/// Answers recorded so far for a pending `item/tool/requestUserInput` request, keyed by
+/// question id. A skipped question maps to `null`.
+pub(crate) fn pending_question_answers(
+    conn: &Connection,
+    approval_key: &str,
+) -> Result<serde_json::Map<String, Value>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT answers_json FROM app_server_approval_requests WHERE approval_key = ?1",
+            params![approval_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    parse_question_answers(raw.flatten())
+}
+
+/// Records one question's answer (`None` for a skipped question) and retires that question's
+/// buttons. Returns false when the request is no longer pending or the question was already
+/// answered, so a late tap or reply can never overwrite an earlier answer.
+pub(crate) fn record_pending_question_answer(
+    conn: &Connection,
+    approval_key: &str,
+    question_id: &str,
+    answer: Option<&str>,
+    now: u64,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT status, answers_json FROM app_server_approval_requests WHERE approval_key = ?1",
+            params![approval_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, raw_answers)) = row else {
+        return Ok(false);
+    };
+    let mut answers = parse_question_answers(raw_answers)?;
+    if status != "pending" || answers.contains_key(question_id) {
+        return Ok(false);
+    }
+    answers.insert(
+        question_id.to_string(),
+        answer.map_or(Value::Null, |answer| json!(answer)),
+    );
+    tx.execute(
+        "UPDATE app_server_approval_requests SET answers_json = ?2
+         WHERE approval_key = ?1 AND status = 'pending'",
+        params![approval_key, serde_json::to_string(&answers)?],
+    )?;
+    tx.execute(
+        "UPDATE telegram_callback_routes SET used_at = ?3
+         WHERE approval_key = ?1 AND question_id = ?2 AND used_at IS NULL",
+        params![approval_key, question_id, to_sql_i64(now)?],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The question a bot message asks, if it is a question message. Settled questions are still
+/// recognised, so a late reply to one is refused instead of being sent to Codex as a new turn.
+pub(crate) fn lookup_question_message_route(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT approval_key, question_id FROM telegram_callback_routes
+         WHERE chat_id = ?1 AND message_id = ?2
+           AND approval_key IS NOT NULL AND question_id IS NOT NULL
+         LIMIT 1",
+        params![chat_id, message_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(crate) fn thread_has_pending_server_request(
+    conn: &Connection,
+    thread_id: &str,
+    method: &str,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM app_server_approval_requests
+             WHERE thread_id = ?1 AND method = ?2 AND status = 'pending'
+             LIMIT 1",
+            params![thread_id, method],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 pub(crate) fn insert_telegram_command_route(
@@ -2243,6 +2372,8 @@ mod tests {
                 thread_id: "thr_approval".to_string(),
                 action: TelegramCallbackAction::Deny,
                 approval_key: None,
+                question_id: None,
+                answer: None,
             },
             1000,
         )
@@ -2295,6 +2426,100 @@ mod tests {
     }
 
     #[test]
+    fn question_answers_are_recorded_once_and_retire_only_that_questions_buttons() {
+        let conn = create_state_db_in_memory().expect("db");
+        let request = AppServerApprovalRequest {
+            approval_key: "question_1".to_string(),
+            request_id: json!(3),
+            method: "item/tool/requestUserInput".to_string(),
+            thread_id: "thr_q".to_string(),
+            turn_id: "turn_q".to_string(),
+            item_id: "call_q".to_string(),
+            params: json!({ "questions": [] }),
+        };
+        upsert_app_server_approval_request(&conn, &request, 1000).expect("store request");
+        for (callback_id, question_id, message_id) in [
+            ("cb_a", "color", 10),
+            ("cb_b", "color", 10),
+            ("cb_c", "size", 11),
+        ] {
+            insert_telegram_callback_route(
+                &conn,
+                &TelegramCallbackRoute {
+                    callback_id: callback_id.to_string(),
+                    chat_id: "456".to_string(),
+                    message_id: Some(message_id),
+                    thread_id: "thr_q".to_string(),
+                    action: TelegramCallbackAction::AnswerOption,
+                    approval_key: Some("question_1".to_string()),
+                    question_id: Some(question_id.to_string()),
+                    answer: Some("x".to_string()),
+                },
+                1000,
+            )
+            .expect("insert route");
+        }
+        let unused = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT callback_id FROM telegram_callback_routes
+                     WHERE used_at IS NULL ORDER BY callback_id",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("rows")
+        };
+
+        assert!(
+            thread_has_pending_server_request(&conn, "thr_q", "item/tool/requestUserInput")
+                .expect("pending question")
+        );
+        assert!(
+            record_pending_question_answer(&conn, "question_1", "color", Some("Blue"), 1100)
+                .expect("record color")
+        );
+        assert!(
+            !record_pending_question_answer(&conn, "question_1", "color", Some("Red"), 1101)
+                .expect("repeat color"),
+            "an answered question keeps its first answer"
+        );
+        assert!(
+            record_pending_question_answer(&conn, "question_1", "size", None, 1102)
+                .expect("skip size")
+        );
+        let answers = pending_question_answers(&conn, "question_1").expect("answers");
+        assert_eq!(answers.get("color"), Some(&json!("Blue")));
+        assert_eq!(answers.get("size"), Some(&Value::Null));
+        assert!(unused(&conn).is_empty());
+        assert_eq!(
+            lookup_question_message_route(&conn, "456", 11).expect("lookup"),
+            Some(("question_1".to_string(), "size".to_string()))
+        );
+        assert_eq!(
+            lookup_question_message_route(&conn, "456", 99).expect("lookup"),
+            None
+        );
+
+        assert!(mark_app_server_approval_responded(&conn, "question_1", 1200).expect("respond"));
+        assert!(
+            pending_question_answers(&conn, "question_1")
+                .expect("answers after response")
+                .is_empty(),
+            "answers, which may be secret, are dropped once Codex has them"
+        );
+        assert!(
+            !record_pending_question_answer(&conn, "question_1", "late", Some("x"), 1300)
+                .expect("late answer")
+        );
+        assert!(
+            !thread_has_pending_server_request(&conn, "thr_q", "item/tool/requestUserInput")
+                .expect("no pending question")
+        );
+    }
+
+    #[test]
     fn app_server_approval_state_dedupes_and_expires_all_related_buttons() {
         let conn = create_state_db_in_memory().expect("db");
         let request = AppServerApprovalRequest {
@@ -2329,6 +2554,8 @@ mod tests {
                     thread_id: "thr_approval".to_string(),
                     action,
                     approval_key: Some("approval_1".to_string()),
+                    question_id: None,
+                    answer: None,
                 },
                 1000,
             )

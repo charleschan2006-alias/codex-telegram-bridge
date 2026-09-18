@@ -2010,6 +2010,7 @@ fn app_server_read_timed_out(error: &anyhow::Error) -> bool {
 const APP_SERVER_COMMAND_APPROVAL_METHOD: &str = "item/commandExecution/requestApproval";
 const APP_SERVER_FILE_APPROVAL_METHOD: &str = "item/fileChange/requestApproval";
 const APP_SERVER_PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
+pub(crate) const APP_SERVER_USER_INPUT_METHOD: &str = "item/tool/requestUserInput";
 
 pub(crate) fn parse_app_server_approval_request(
     message: &Value,
@@ -2022,6 +2023,7 @@ pub(crate) fn parse_app_server_approval_request(
         APP_SERVER_COMMAND_APPROVAL_METHOD
             | APP_SERVER_FILE_APPROVAL_METHOD
             | APP_SERVER_PERMISSIONS_APPROVAL_METHOD
+            | APP_SERVER_USER_INPUT_METHOD
     ) {
         return Ok(None);
     }
@@ -2055,8 +2057,13 @@ pub(crate) fn parse_app_server_approval_request(
         "params": params,
     });
     let digest = crate::sha256_hex(serde_json::to_string(&identity)?.as_bytes());
+    let key_prefix = if method == APP_SERVER_USER_INPUT_METHOD {
+        "question"
+    } else {
+        "approval"
+    };
     Ok(Some(AppServerApprovalRequest {
-        approval_key: format!("approval_{}", &digest[..32]),
+        approval_key: format!("{key_prefix}_{}", &digest[..32]),
         request_id,
         method: method.to_string(),
         thread_id,
@@ -2086,10 +2093,16 @@ pub(crate) fn app_server_approval_response(
                 TelegramCallbackAction::Approve => "accept",
                 TelegramCallbackAction::ApproveForSession => "acceptForSession",
                 TelegramCallbackAction::Deny => "decline",
+                TelegramCallbackAction::AnswerOption | TelegramCallbackAction::SkipQuestion => {
+                    bail!("question buttons cannot answer an approval request")
+                }
             };
             Ok(json!({ "decision": decision }))
         }
         APP_SERVER_PERMISSIONS_APPROVAL_METHOD => {
+            if action.answers_question() {
+                bail!("question buttons cannot answer an approval request");
+            }
             let permissions = match action {
                 TelegramCallbackAction::Approve | TelegramCallbackAction::ApproveForSession => {
                     request
@@ -2098,11 +2111,11 @@ pub(crate) fn app_server_approval_response(
                         .cloned()
                         .context("permissions approval request is missing permissions")?
                 }
-                TelegramCallbackAction::Deny => json!({}),
+                _ => json!({}),
             };
             let scope = match action {
                 TelegramCallbackAction::ApproveForSession => "session",
-                TelegramCallbackAction::Approve | TelegramCallbackAction::Deny => "turn",
+                _ => "turn",
             };
             Ok(json!({ "permissions": permissions, "scope": scope }))
         }
@@ -2223,6 +2236,141 @@ pub(crate) fn app_server_approval_event(
             "summary": app_server_approval_summary(request, item),
         }
     })
+}
+
+/// One question from an `item/tool/requestUserInput` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppServerQuestion {
+    pub(crate) id: String,
+    pub(crate) header: String,
+    pub(crate) question: String,
+    /// Codex expects the client to offer a free-form answer next to the options.
+    pub(crate) is_other: bool,
+    pub(crate) is_secret: bool,
+    /// (label, description) pairs. Empty means the question only takes free text.
+    pub(crate) options: Vec<(String, String)>,
+}
+
+impl AppServerQuestion {
+    pub(crate) fn accepts_free_text(&self) -> bool {
+        self.is_other || self.options.is_empty()
+    }
+}
+
+pub(crate) fn is_app_server_question_request(request: &AppServerApprovalRequest) -> bool {
+    request.method == APP_SERVER_USER_INPUT_METHOD
+}
+
+pub(crate) fn app_server_questions(request: &AppServerApprovalRequest) -> Vec<AppServerQuestion> {
+    let text = |value: &Value, field: &str| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    request
+        .params
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|question| {
+            let id = question.get("id").and_then(Value::as_str)?.to_string();
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let label = option.get("label").and_then(Value::as_str)?;
+                    Some((label.to_string(), text(option, "description")))
+                })
+                .collect();
+            Some(AppServerQuestion {
+                id,
+                header: text(question, "header"),
+                question: text(question, "question"),
+                is_other: question
+                    .get("isOther")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_secret: question
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                options,
+            })
+        })
+        .collect()
+}
+
+/// One Telegram event per question: each gets its own message, so a Reply unambiguously
+/// answers the question it replies to.
+pub(crate) fn app_server_question_events(
+    request: &AppServerApprovalRequest,
+    observed_at: u64,
+) -> Vec<Value> {
+    let questions = app_server_questions(request);
+    let total = questions.len();
+    questions
+        .into_iter()
+        .enumerate()
+        .map(|(index, question)| {
+            json!({
+                "type": "thread_waiting",
+                "eventKey": format!("{}:{}", request.approval_key, question.id),
+                "threadId": request.thread_id,
+                "turnId": request.turn_id,
+                "itemId": request.item_id,
+                "promptKind": "question",
+                "observedAt": observed_at,
+                "questionRequest": {
+                    "questionKey": request.approval_key,
+                    "requestId": request.request_id,
+                    "questionId": question.id,
+                    "index": index + 1,
+                    "total": total,
+                    "header": question.header,
+                    "question": question.question,
+                    "isOther": question.is_other,
+                    "isSecret": question.is_secret,
+                    "options": question
+                        .options
+                        .iter()
+                        .map(|(label, description)| json!({
+                            "label": label,
+                            "description": description,
+                        }))
+                        .collect::<Vec<_>>(),
+                }
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn app_server_question_answers_complete(
+    request: &AppServerApprovalRequest,
+    answers: &serde_json::Map<String, Value>,
+) -> bool {
+    app_server_questions(request)
+        .iter()
+        .all(|question| answers.contains_key(&question.id))
+}
+
+/// Skipped questions are left out: Codex treats a missing answer as "use your judgment".
+pub(crate) fn app_server_question_response(
+    request: &AppServerApprovalRequest,
+    answers: &serde_json::Map<String, Value>,
+) -> Value {
+    let answered = app_server_questions(request)
+        .into_iter()
+        .filter_map(|question| {
+            let answer = answers.get(&question.id)?.as_str()?;
+            Some((question.id, json!({ "answers": [answer] })))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({ "answers": answered })
 }
 
 fn handle_app_server_message(
@@ -2490,6 +2638,76 @@ mod tests {
             handle_app_server_message(&response, 7, &mut notifications, &mut server_requests)
                 .expect("response parse");
         assert_eq!(parsed, Some(json!({ "ok": true })));
+    }
+
+    #[test]
+    fn app_server_user_input_requests_become_one_event_per_question() {
+        let message = json!({
+            "id": 0,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thr_q",
+                "turnId": "turn_q",
+                "itemId": "call_q",
+                "isBlocking": true,
+                "autoResolutionMs": null,
+                "questions": [
+                    {
+                        "id": "color", "header": "Color", "question": "Which color?",
+                        "isOther": true, "isSecret": false,
+                        "options": [{ "label": "Red", "description": "Red" }]
+                    },
+                    {
+                        "id": "token", "header": "Token", "question": "API token?",
+                        "isOther": false, "isSecret": true, "options": null
+                    },
+                    { "header": "no id, ignored", "question": "?" }
+                ]
+            }
+        });
+
+        let request = parse_app_server_approval_request(&message)
+            .expect("parse")
+            .expect("user input request");
+        assert!(request.approval_key.starts_with("question_"));
+        assert!(is_app_server_question_request(&request));
+
+        let questions = app_server_questions(&request);
+        assert_eq!(questions.len(), 2);
+        assert!(questions[0].accepts_free_text());
+        assert!(
+            questions[1].accepts_free_text(),
+            "no options means free text only"
+        );
+        assert!(questions[1].is_secret);
+
+        let events = app_server_question_events(&request, 5000);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "thread_waiting");
+        assert_eq!(events[0]["promptKind"], "question");
+        assert_eq!(
+            events[0]["eventKey"],
+            format!("{}:color", request.approval_key)
+        );
+        assert_eq!(events[1]["questionRequest"]["index"], 2);
+        assert_eq!(events[1]["questionRequest"]["total"], 2);
+        assert_eq!(events[1]["questionRequest"]["isSecret"], true);
+        assert_eq!(events[0]["questionRequest"]["options"][0]["label"], "Red");
+
+        let mut answers = serde_json::Map::new();
+        answers.insert("color".to_string(), json!("Red"));
+        assert!(!app_server_question_answers_complete(&request, &answers));
+        answers.insert("token".to_string(), Value::Null);
+        assert!(app_server_question_answers_complete(&request, &answers));
+        assert_eq!(
+            app_server_question_response(&request, &answers),
+            json!({ "answers": { "color": { "answers": ["Red"] } } }),
+            "a skipped question is left out of the response"
+        );
+        assert!(
+            app_server_approval_response(&request, TelegramCallbackAction::Approve).is_err(),
+            "approval buttons cannot answer a question"
+        );
     }
 
     #[test]

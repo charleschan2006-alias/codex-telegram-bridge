@@ -6,6 +6,8 @@ All notable changes to `codex-telegram-bridge` will be documented here.
 
 - Add `setup --codex-home` and `telegram setup --codex-home`; setup stores `~/.codex` when omitted, and the daemon passes the saved `CODEX_HOME` to its managed Codex App Server.
 - Keep a persistent App Server subscription to active threads and bridge native command, file-change, and permissions approval requests to Telegram with exact request-bound `Allow once`, `Allow session`, and `Deny` buttons.
+- Bridge Codex questions (`item/tool/requestUserInput`, asked in Plan mode) to Telegram: one message per question with option buttons and `Skip`, Telegram Reply for free-form answers when Codex allows them, and all answers sent back in a single App Server response once every question is answered or skipped. Answered questions show the choice and lose their buttons; secret answers are deleted from the chat and kept out of local logs.
+- Keep `cargo test` from stopping a locally installed daemon.
 - Redact service-manager stdout and stderr from `daemon status` so inherited environment variables and credentials are never returned in its JSON output.
 
 ## 0.1.1 - 2026-08-08

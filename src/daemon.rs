@@ -11,17 +11,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codex::{
-    app_server_approval_event, codex_backend_from_config, filter_watch_events,
-    parse_app_server_approval_request, parse_event_filter, start_codex_watch_receiver,
-    sync_state_from_live, watch_events_from_sync_result, watch_thread_error_event,
-    CodexAppServerClient,
+    app_server_approval_event, app_server_question_events, codex_backend_from_config,
+    filter_watch_events, is_app_server_question_request, parse_app_server_approval_request,
+    parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
+    watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient,
+    APP_SERVER_USER_INPUT_METHOD,
 };
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event,
     lookup_pending_app_server_approval, pending_outbound_count, prune_state_logs,
     record_transport_delivery, resolve_app_server_approval_request, should_emit_for_away_window,
-    state_db_path, transport_delivery_exists, upsert_app_server_approval_request,
-    OutboxDeliverySummary,
+    state_db_path, thread_has_pending_server_request, transport_delivery_exists,
+    upsert_app_server_approval_request, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
@@ -264,7 +265,9 @@ fn collect_daemon_app_server_events(
 ) -> Result<Vec<Value>> {
     let mut observed_approvals = Vec::new();
     for message in client.drain_server_requests() {
-        let Some(request) = parse_app_server_approval_request(&message)? else {
+        // A malformed request is skipped rather than failing the cycle: failing would drop
+        // the App Server connection and replay the same request forever.
+        let Ok(Some(request)) = parse_app_server_approval_request(&message) else {
             continue;
         };
         let is_new = upsert_app_server_approval_request(conn, &request, now)?;
@@ -298,6 +301,14 @@ fn collect_daemon_app_server_events(
             continue;
         }
         if let Some(request) = lookup_pending_app_server_approval(conn, &request.approval_key)? {
+            if is_app_server_question_request(&request) {
+                native_events.extend(
+                    app_server_question_events(&request, now)
+                        .into_iter()
+                        .map(|event| enrich_approval_event_with_thread(event, sync_result)),
+                );
+                continue;
+            }
             let item = notifications.iter().find_map(|notification| {
                 if notification.get("method").and_then(Value::as_str) != Some("item/started")
                     || notification
@@ -321,15 +332,30 @@ fn collect_daemon_app_server_events(
             ));
         }
     }
-    let mut events = watch_events_from_sync_result(sync_result, notifications, filter);
-    events.retain(|event| {
-        !(event.get("type").and_then(Value::as_str) == Some("thread_waiting")
-            && event.get("promptKind").and_then(Value::as_str) == Some("approval")
-            && event
-                .get("threadId")
-                .and_then(Value::as_str)
-                .is_some_and(|thread_id| active_native_threads.contains(thread_id)))
-    });
+    let events = watch_events_from_sync_result(sync_result, notifications, filter);
+    let mut kept = Vec::with_capacity(events.len());
+    for event in events {
+        let thread_id = event.get("threadId").and_then(Value::as_str);
+        let generic_waiting = event.get("type").and_then(Value::as_str) == Some("thread_waiting");
+        let suppressed = match (generic_waiting, thread_id) {
+            (true, Some(thread_id)) => match event.get("promptKind").and_then(Value::as_str) {
+                Some("approval") => active_native_threads.contains(thread_id),
+                // `waitingOnUserInput` also marks a pending question, which gets its own
+                // answerable message; a generic "reply" nudge would start a separate turn.
+                Some("reply") => thread_has_pending_server_request(
+                    conn,
+                    thread_id,
+                    APP_SERVER_USER_INPUT_METHOD,
+                )?,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !suppressed {
+            kept.push(event);
+        }
+    }
+    let mut events = kept;
     events.extend(filter_watch_events(native_events, filter));
     Ok(events)
 }

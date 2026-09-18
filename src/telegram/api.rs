@@ -175,6 +175,59 @@ pub(crate) fn telegram_answer_callback_query(
     )
 }
 
+/// Replaces a bot message's text. Omitting `reply_markup` also removes its inline keyboard.
+pub(crate) fn telegram_edit_message_text(
+    telegram: &TelegramConfig,
+    message_id: i64,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "editMessageText",
+        &json!({
+            "chat_id": telegram.chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": true
+        }),
+        timeout,
+    )
+}
+
+pub(crate) fn telegram_remove_inline_keyboard(
+    telegram: &TelegramConfig,
+    message_id: i64,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "editMessageReplyMarkup",
+        &json!({
+            "chat_id": telegram.chat_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [] }
+        }),
+        timeout,
+    )
+}
+
+pub(crate) fn telegram_delete_message(
+    telegram: &TelegramConfig,
+    message_id: i64,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "deleteMessage",
+        &json!({
+            "chat_id": telegram.chat_id,
+            "message_id": message_id
+        }),
+        timeout,
+    )
+}
+
 pub(crate) fn telegram_updates_array(updates: &Value) -> Result<&[Value]> {
     updates
         .get("result")

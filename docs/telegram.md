@@ -10,6 +10,7 @@ The intended behavior:
 - `/threads` sends recent Codex threads as reply-routable Telegram messages
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - native App Server approval messages include `Allow once`, `Allow session`, and `Deny` buttons
+- Codex questions (Plan mode) arrive as one message per question, with option buttons, `Skip`, and Reply for free-form answers
 - slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
 
 Hermes can still control Codex through MCP when you ask it to, but Hermes and MCP do not own Telegram delivery.
@@ -128,6 +129,18 @@ When Codex needs attention and you are away, the daemon sends a Telegram message
 After a Telegram reply, approval callback, or `/new` prompt starts a Codex turn, the daemon refreshes Telegram's `typing` chat action until the answer is delivered or the short-lived typing window expires.
 
 For native approval prompts, use `Allow once`, `Allow session`, or `Deny`. The callback data contains only an opaque route id. The exact App Server request id plus its thread, turn, and item ids stay in the local SQLite route table. Duplicate taps are ignored, and a request already answered by another App Server client is reported as expired.
+
+## Codex Questions
+
+In Plan mode Codex can ask structured questions (`item/tool/requestUserInput`) instead of writing them in prose. Each question arrives as its own Telegram message:
+
+- tap an option button to answer, or `Skip` to let Codex use its own judgment
+- when Codex allows a free-form answer (or offers no options), use Telegram's Reply on that question message; the reply answers that question and is never sent to Codex as a new turn, even after the question is settled
+- Codex receives all answers in one response, so when it asks several questions the bridge holds earlier answers until every question is answered or skipped
+- an answered question shows the choice and loses its buttons; taps on a question that another client already answered are rejected
+- for questions Codex marks as secret, the reply is deleted from the chat once Codex has it, and answer text is never written to the local logs
+
+Codex only uses structured questions in Plan mode (`/plan` in a `codex --remote` TUI). Outside Plan mode it asks in prose, which arrives as a normal "Codex needs you" message you answer with Reply.
 
 ## Interactive CLI Approval Flow
 

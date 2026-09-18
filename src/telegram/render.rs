@@ -178,6 +178,179 @@ fn compact_telegram_file_reference(candidate: &str) -> Option<String> {
     }
 }
 
+fn telegram_question_callback_id(
+    event_id: &str,
+    action: TelegramCallbackAction,
+    option_index: usize,
+) -> String {
+    let digest =
+        crate::sha256_hex(format!("{event_id}:{}:{option_index}", action.as_str()).as_bytes());
+    format!("cb_{}", &digest[..24])
+}
+
+fn option_letter(index: usize) -> String {
+    char::from_u32('A' as u32 + index as u32)
+        .filter(char::is_ascii_uppercase)
+        .map_or_else(|| (index + 1).to_string(), String::from)
+}
+
+/// A question from `item/tool/requestUserInput`: option buttons plus Skip, and a Reply for
+/// free-form answers when Codex allows one.
+fn prepare_question_delivery(
+    chat_id: &str,
+    event: &Value,
+    question: &Value,
+    event_id: String,
+    thread_id: Option<String>,
+) -> PreparedTelegramDelivery {
+    let text = |field: &str| {
+        question
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+    };
+    let index = question.get("index").and_then(Value::as_u64).unwrap_or(1);
+    let total = question.get("total").and_then(Value::as_u64).unwrap_or(1);
+    let is_secret = question
+        .get("isSecret")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let options = question
+        .get("options")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|option| {
+            let label = option.get("label").and_then(Value::as_str)?.trim();
+            let description = option
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            Some((label.to_string(), description.to_string()))
+        })
+        .collect::<Vec<_>>();
+    let accepts_free_text = question
+        .get("isOther")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || options.is_empty();
+
+    let title = if total > 1 {
+        format!("❓ Codex has a question ({index}/{total})")
+    } else {
+        "❓ Codex has a question".to_string()
+    };
+    let mut lines = vec![title, format!("🧵 {}", telegram_event_display_name(event))];
+    if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
+        lines.push(format!("📁 {project}"));
+    }
+    lines.push(String::new());
+    if !text("header").is_empty() {
+        lines.push(format!("【{}】", text("header")));
+    }
+    lines.push(text("question").to_string());
+    let described = options
+        .iter()
+        .any(|(label, description)| !description.is_empty() && description != label);
+    if described {
+        lines.push(String::new());
+        for (position, (label, description)) in options.iter().enumerate() {
+            if description.is_empty() || description == label {
+                lines.push(format!("{}. {label}", option_letter(position)));
+            } else {
+                lines.push(format!(
+                    "{}. {label} — {description}",
+                    option_letter(position)
+                ));
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push(
+        match (options.is_empty(), accepts_free_text) {
+            (true, _) => "💬 Use Telegram's Reply on this message to type your answer.",
+            (false, true) => {
+                "Tap an option, or use Telegram's Reply on this message to type your own answer."
+            }
+            (false, false) => "Tap one option below.",
+        }
+        .to_string(),
+    );
+    if is_secret {
+        lines.push(
+            "🔒 Codex marked this answer as secret: your reply is deleted from this chat once Codex has it."
+                .to_string(),
+        );
+    }
+    if total > 1 {
+        lines.push(format!(
+            "Codex gets the answers once all {total} questions are answered or skipped."
+        ));
+    }
+
+    let mut payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
+        .into_iter()
+        .map(|text| {
+            json!({
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": true
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut callback_routes = Vec::new();
+    let question_key = question.get("questionKey").and_then(Value::as_str);
+    let question_id = question.get("questionId").and_then(Value::as_str);
+    if let (Some(question_key), Some(question_id), Some(thread_id)) =
+        (question_key, question_id, thread_id.as_ref())
+    {
+        let mut keyboard = Vec::new();
+        let mut route = |action, option_index, answer: Option<&str>| {
+            let callback_id = telegram_question_callback_id(&event_id, action, option_index);
+            callback_routes.push(TelegramCallbackRoute {
+                callback_id: callback_id.clone(),
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.clone(),
+                action,
+                approval_key: Some(question_key.to_string()),
+                question_id: Some(question_id.to_string()),
+                answer: answer.map(str::to_string),
+            });
+            format!("codex:{callback_id}")
+        };
+        for (position, (label, _)) in options.iter().enumerate() {
+            let callback_data = route(
+                TelegramCallbackAction::AnswerOption,
+                position,
+                Some(label.as_str()),
+            );
+            keyboard.push(json!([{
+                "text": format!(
+                    "{}. {}",
+                    option_letter(position),
+                    trim_for_telegram_line(label, 60)
+                ),
+                "callback_data": callback_data,
+            }]));
+        }
+        let skip_data = route(TelegramCallbackAction::SkipQuestion, 0, None);
+        keyboard.push(json!([{ "text": "⏭ Skip", "callback_data": skip_data }]));
+        payloads[0]["reply_markup"] = json!({ "inline_keyboard": keyboard });
+    }
+
+    PreparedTelegramDelivery {
+        payloads,
+        thread_id,
+        event_id,
+        callback_routes,
+    }
+}
+
 pub(crate) fn prepare_telegram_delivery(
     chat_id: &str,
     event: &Value,
@@ -188,6 +361,11 @@ pub(crate) fn prepare_telegram_delivery(
         .unwrap_or("codex_event");
     let event_id = crate::notification_event_id(event);
     let thread_id = crate::event_thread_id(event);
+    if let Some(question) = event.get("questionRequest") {
+        return Ok(prepare_question_delivery(
+            chat_id, event, question, event_id, thread_id,
+        ));
+    }
     let mut lines = vec![
         telegram_event_title(event_type, event).to_string(),
         format!("🧵 {}", telegram_event_display_name(event)),
@@ -243,6 +421,8 @@ pub(crate) fn prepare_telegram_delivery(
                 thread_id: thread_id.clone(),
                 action: TelegramCallbackAction::Approve,
                 approval_key: Some(approval_key.to_string()),
+                question_id: None,
+                answer: None,
             });
             callback_routes.push(TelegramCallbackRoute {
                 callback_id: approve_session_id,
@@ -251,6 +431,8 @@ pub(crate) fn prepare_telegram_delivery(
                 thread_id: thread_id.clone(),
                 action: TelegramCallbackAction::ApproveForSession,
                 approval_key: Some(approval_key.to_string()),
+                question_id: None,
+                answer: None,
             });
             callback_routes.push(TelegramCallbackRoute {
                 callback_id: deny_id,
@@ -259,6 +441,8 @@ pub(crate) fn prepare_telegram_delivery(
                 thread_id: thread_id.clone(),
                 action: TelegramCallbackAction::Deny,
                 approval_key: Some(approval_key.to_string()),
+                question_id: None,
+                answer: None,
             });
         }
     }
@@ -658,6 +842,124 @@ mod tests {
         assert!(text.contains("README.md L1-L24"));
         assert!(text.contains("airbnb-design-implementation.md L1-L19"));
         assert!(!text.contains("[F:/Users/hanifcarroll/projects/ui-experiment/README.md"));
+    }
+
+    #[test]
+    fn telegram_question_payload_has_option_buttons_skip_and_bound_routes() {
+        let long_label =
+            "A very long option label that keeps going well past what fits on a button";
+        let event = json!({
+            "type": "thread_waiting",
+            "eventKey": "question_abc:color",
+            "threadId": "thr_q",
+            "promptKind": "question",
+            "thread": { "displayName": "Pick a color", "project": "demo" },
+            "questionRequest": {
+                "questionKey": "question_abc",
+                "questionId": "color",
+                "index": 1,
+                "total": 2,
+                "header": "Color",
+                "question": "Which color?",
+                "isOther": true,
+                "isSecret": false,
+                "options": [
+                    { "label": "Red (Recommended)", "description": "Warm" },
+                    { "label": long_label, "description": long_label }
+                ]
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("456", &event).expect("prepare question");
+
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.starts_with("❓ Codex has a question (1/2)\n🧵 Pick a color\n📁 demo"));
+        assert!(text.contains("【Color】\nWhich color?"));
+        assert!(text.contains("A. Red (Recommended) — Warm"));
+        assert!(text.contains(&format!("B. {long_label}\n")));
+        assert!(text.contains("use Telegram's Reply on this message to type your own answer"));
+        assert!(text.contains("once all 2 questions are answered or skipped"));
+
+        let keyboard = prepared.payloads[0]["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("keyboard");
+        let buttons = keyboard
+            .iter()
+            .map(|row| row[0]["text"].as_str().expect("button text"))
+            .collect::<Vec<_>>();
+        assert_eq!(buttons[0], "A. Red (Recommended)");
+        assert!(buttons[1].starts_with("B. A very long") && buttons[1].ends_with("..."));
+        assert_eq!(buttons[2], "⏭ Skip");
+        for row in keyboard {
+            let data = row[0]["callback_data"].as_str().expect("callback data");
+            assert!(data.starts_with("codex:cb_"));
+            assert!(
+                data.len() <= 64,
+                "callback_data must fit Telegram's 64 bytes"
+            );
+        }
+
+        assert_eq!(prepared.callback_routes.len(), 3);
+        let answers = prepared
+            .callback_routes
+            .iter()
+            .map(|route| (route.action, route.answer.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            answers,
+            vec![
+                (
+                    TelegramCallbackAction::AnswerOption,
+                    Some("Red (Recommended)")
+                ),
+                (TelegramCallbackAction::AnswerOption, Some(long_label)),
+                (TelegramCallbackAction::SkipQuestion, None),
+            ]
+        );
+        for route in &prepared.callback_routes {
+            assert_eq!(route.approval_key.as_deref(), Some("question_abc"));
+            assert_eq!(route.question_id.as_deref(), Some("color"));
+            assert_eq!(route.thread_id, "thr_q");
+        }
+        let unique = prepared
+            .callback_routes
+            .iter()
+            .map(|route| route.callback_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 3, "every button needs its own callback id");
+    }
+
+    #[test]
+    fn telegram_free_text_and_secret_questions_say_how_to_answer() {
+        let event = json!({
+            "type": "thread_waiting",
+            "eventKey": "question_abc:token",
+            "threadId": "thr_q",
+            "questionRequest": {
+                "questionKey": "question_abc",
+                "questionId": "token",
+                "index": 1,
+                "total": 1,
+                "header": "",
+                "question": "Paste the API token",
+                "isOther": false,
+                "isSecret": true,
+                "options": null
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("456", &event).expect("prepare question");
+
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.starts_with("❓ Codex has a question\n"));
+        assert!(text.contains("Use Telegram's Reply on this message to type your answer."));
+        assert!(text.contains("🔒 Codex marked this answer as secret"));
+        assert!(!text.contains("questions are answered or skipped"));
+        let keyboard = prepared.payloads[0]["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("keyboard");
+        assert_eq!(keyboard.len(), 1, "a free-text question only offers Skip");
+        assert_eq!(keyboard[0][0]["text"], "⏭ Skip");
     }
 
     #[test]
