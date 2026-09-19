@@ -2,6 +2,10 @@
 
 All notable changes to `codex-telegram-bridge` will be documented here.
 
+## Unreleased
+
+- When a Telegram reply cannot reach a thread because another Codex session that is not connected to the bridge holds it (`thread … already has an active writer`), explain that and suggest the `codex resume <id> --remote <url>` command instead of forwarding the raw JSON-RPC error.
+
 ## 0.2.0 - 2026-09-18
 
 This fork is now the maintained version: both [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge) and [zhang0098/codex-telegram-bridge](https://github.com/zhang0098/codex-telegram-bridge) are archived. Repository and install URLs point at [charleschan2006-alias/codex-telegram-bridge](https://github.com/charleschan2006-alias/codex-telegram-bridge).

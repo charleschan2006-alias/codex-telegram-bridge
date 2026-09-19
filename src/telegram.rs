@@ -16,7 +16,7 @@ use crate::codex::{
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
-    delete_setting, due_telegram_message_deletions, expire_app_server_approval,
+    cached_thread_name, delete_setting, due_telegram_message_deletions, expire_app_server_approval,
     finish_telegram_message_deletion, get_setting_number, get_telegram_current_project_id,
     insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
     list_recent_thread_snapshots_from_db, lookup_app_server_request,
@@ -1985,6 +1985,38 @@ fn retry_pending_message_deletions(
     Ok(())
 }
 
+/// The thread named in Codex's "thread <id> already has an active writer" rejection. Codex
+/// allows one writer per thread, so a thread still open in a Codex session that is not attached
+/// to the bridge's backend cannot take a turn from the bridge.
+fn thread_with_other_writer(error: &str) -> Option<&str> {
+    let before = &error[..error.find(" already has an active writer")?];
+    before
+        .rsplit(|ch: char| ch.is_whitespace() || ch == '"')
+        .next()
+        .filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'))
+}
+
+/// What to tell the user when their message could not be processed.
+fn telegram_update_error_text(conn: &Connection, config: &DaemonConfig, error: &str) -> String {
+    let Some(thread_id) = thread_with_other_writer(error) else {
+        return format!("Your message could not be processed: {error}");
+    };
+    let thread = cached_thread_name(conn, thread_id)
+        .ok()
+        .flatten()
+        .map_or_else(|| thread_id.to_string(), |name| format!("\"{name}\""));
+    let websocket_url = config
+        .codex
+        .as_ref()
+        .map_or("ws://127.0.0.1:4500", |codex| codex.websocket_url.as_str());
+    format!(
+        "⚠️ Your reply was not sent: Codex thread {thread} is open in another Codex session \
+         that is not connected to the bridge.\n\n\
+         Reply in that session, or reopen it on the bridge's backend:\n\
+         codex resume {thread_id} --remote {websocket_url}"
+    )
+}
+
 fn advance_telegram_ack_offset(max_acked: &mut Option<i64>, update_id: Option<i64>) {
     if let Some(update_id) = update_id {
         *max_acked = Some(max_acked.map_or(update_id, |current: i64| current.max(update_id)));
@@ -2494,7 +2526,7 @@ fn process_telegram_update_batch(
             if update.get("message").is_some() {
                 let _ = telegram_send_text(
                     telegram,
-                    &format!("Your message could not be processed: {error:#}"),
+                    &telegram_update_error_text(conn, config, &format!("{error:#}")),
                     timeout,
                 );
             }
@@ -3475,6 +3507,41 @@ mod tests {
         assert_eq!(
             budgeted_timeout(timeout, Some(Instant::now() + Duration::from_secs(60))),
             Some(timeout)
+        );
+    }
+
+    #[test]
+    fn a_thread_owned_by_another_codex_session_gets_an_actionable_hint() {
+        // The exact error from the log when a CLI outside the bridge holds the thread.
+        let error = r#"{"code":-32600,"message":"thread 01a0708d-4046-7a30-8b5d-6f1710a42a9c already has an active writer"}"#;
+        assert_eq!(
+            thread_with_other_writer(error),
+            Some("01a0708d-4046-7a30-8b5d-6f1710a42a9c")
+        );
+        assert_eq!(thread_with_other_writer("request timed out"), None);
+
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        conn.execute(
+            "INSERT INTO threads_cache(thread_id, name, status_type, status_flags_json, last_seen_at)
+             VALUES ('01a0708d-4046-7a30-8b5d-6f1710a42a9c', '揭棋ai训练', 'notLoaded', '[]', 0)",
+            [],
+        )
+        .expect("cache thread");
+        let config = question_test_config("ws://127.0.0.1:4500");
+
+        let text = telegram_update_error_text(&conn, &config, error);
+
+        assert!(text.starts_with("⚠️ Your reply was not sent: Codex thread \"揭棋ai训练\" is open"));
+        assert!(text.ends_with(
+            "codex resume 01a0708d-4046-7a30-8b5d-6f1710a42a9c --remote ws://127.0.0.1:4500"
+        ));
+        assert!(
+            !text.contains("-32600"),
+            "the raw JSON-RPC error is not shown"
+        );
+        assert_eq!(
+            telegram_update_error_text(&conn, &config, "request timed out"),
+            "Your message could not be processed: request timed out"
         );
     }
 

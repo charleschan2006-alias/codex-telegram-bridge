@@ -1227,6 +1227,17 @@ pub(crate) fn list_waiting_from_db(
     })
 }
 
+pub(crate) fn cached_thread_name(conn: &Connection, thread_id: &str) -> Result<Option<String>> {
+    let name: Option<Option<String>> = conn
+        .query_row(
+            "SELECT name FROM threads_cache WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(name.flatten().filter(|name| !name.trim().is_empty()))
+}
+
 pub(crate) fn list_recent_thread_snapshots_from_db(
     conn: &Connection,
     limit: u64,
